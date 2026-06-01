@@ -1,0 +1,26 @@
+pub const CAN_ID_EMERGENCY_STOP_PARA: u16 = 0x003;
+pub const CAN_ID_STOP_SEQUENCE: u16 = 0x00a;
+pub const CAN_ID_START_SEQUENCE: u16 = 0x005;
+// pub const CAN_ID_ACTUATE_PARA: u16 = 0x00d;
+pub const CAN_ID_ERASE_FLASH: u16 = 0x00f;
+pub const CAN_ID_STAET_LOGGING: u16 = 0x011;
+pub const CAN_ID_STOP_LOGGING: u16 = 0x01e;
+pub const CAN_ID_STAET_RECORDING: u16 = 0x020;
+pub const CAN_ID_STOP_RECORDING: u16 = 0x02a;
+pub const CAN_ID_POWER_ON_CAMERA: u16 = 0x02f;
+pub const CAN_ID_POWER_OFF_CAMERA: u16 = 0x030;
+pub const CAN_ID_ANGLE_SPEED: u16 = 0x120;
+pub const CAN_ID_ACCELARATION: u16 = 0x11a;
+pub const CAN_ID_AIR_PRESSURE: u16 = 0x10a;
+pub const CAN_ID_LIFT_OFF: u16 = 0x110;
+pub const CAN_ID_TOP: u16 = 0x12a;
+pub const CAN_ID_CAMERA_STATUS: u16 = 0x200;
+pub const CAN_ID_TEST_TO_LOG_PARA: u16 = 0x300;
+pub const CAN_ID_TEST_FROM_LOG_PARA: u16 = 0x301;
+pub const CAN_ID_TEST_TO_CAMERA: u16 = 0x310;
+pub const CAN_ID_TEST_FROM_CAMERA: u16 = 0x311;
+// pub const CAN_ID_TEST_TO_POWER_CONTROL: u16 = 0x320;
+// pub const CAN_ID_TEST_FROM_POWER_CONTROL: u16 = 0x321;
+
+pub const BUF_SIZE: usize = 2048;
+pub const LORA_TRANSMIT_INTERVAL_MS: u64 = 1500;
