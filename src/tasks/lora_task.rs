@@ -1,14 +1,14 @@
 use core::sync::atomic::Ordering;
 
-use embassy_futures::select::{Either, select};
-use embassy_time::{Duration, Instant, Timer};
+use embassy_futures::select::{Either3, select3};
+use embassy_time::{Duration, Instant, Ticker, Timer};
 use esp_hal::{Async, gpio::Input, uart::Uart};
 use esp_println::println;
 
 use crate::{
     constants::{
         CAN_ID_EMERGENCY_STOP_PARA, CAN_ID_ERASE_FLASH, CAN_ID_POWER_OFF_CAMERA,
-        CAN_ID_POWER_ON_CAMERA, CAN_ID_STAET_LOGGING, CAN_ID_STAET_RECORDING,
+        CAN_ID_POWER_ON_CAMERA, CAN_ID_START_LOGGING, CAN_ID_START_RECORDING,
         CAN_ID_START_SEQUENCE, CAN_ID_STOP_LOGGING, CAN_ID_STOP_RECORDING, CAN_ID_STOP_SEQUENCE,
         LORA_TRANSMIT_INTERVAL_MS,
     },
@@ -24,9 +24,9 @@ const fn get_target_can_id(cmd: u8) -> Option<u16> {
         b's' => Some(CAN_ID_START_SEQUENCE),
         // b'p' => Some(CAN_ID_ACTUATE_PARA),
         b'x' => Some(CAN_ID_ERASE_FLASH),
-        b'l' => Some(CAN_ID_STAET_LOGGING),
+        b'l' => Some(CAN_ID_START_LOGGING),
         b'm' => Some(CAN_ID_STOP_LOGGING),
-        b'c' => Some(CAN_ID_STAET_RECORDING),
+        b'c' => Some(CAN_ID_START_RECORDING),
         b'v' => Some(CAN_ID_STOP_RECORDING),
         b'i' => Some(CAN_ID_POWER_ON_CAMERA),
         b'o' => Some(CAN_ID_POWER_OFF_CAMERA),
@@ -69,36 +69,37 @@ pub async fn command_process_task() {
 #[embassy_executor::task]
 pub async fn lora_task(mut uart: Uart<'static, Async>, mut aux_pin: Input<'static>) {
     let mut rx_buf = [0u8; 64];
-    let mut last_tx = Instant::now();
+    let mut tx_ticker = Ticker::every(Duration::from_millis(LORA_TRANSMIT_INTERVAL_MS));
 
     loop {
-        let receive_fut = select(TRIGGER_SIGNAL.wait(), uart.read_async(&mut rx_buf));
-
-        match embassy_time::with_timeout(Duration::from_secs(3), receive_fut).await {
-            Ok(Either::First(_trigger)) => {}
-            Ok(Either::Second(Ok(len))) => {
+        match select3(
+            TRIGGER_SIGNAL.wait(),
+            uart.read_async(&mut rx_buf),
+            tx_ticker.next(),
+        )
+        .await
+        {
+            Either3::First(_trigger) => {}
+            Either3::Second(Ok(len)) => {
                 if len > 0 {
                     println!("cmd: {:?}", &rx_buf[..len]);
                     RECEIVED_DATA_CHANNEL.send(rx_buf[0]).await;
                 }
             }
-            Ok(Either::Second(Err(_))) => {}
-            Err(_) => {}
-        }
+            Either3::Second(Err(_)) => {}
+            Either3::Third(_) => {
+                let payload = {
+                    let mut payload = PAYLOAD_MUTEX.lock().await;
+                    payload.check_sum = payload.calculate_checksum();
+                    *payload
+                };
+                let payload_bytes = payload.to_bytes();
 
-        if last_tx.elapsed().as_millis() >= LORA_TRANSMIT_INTERVAL_MS {
-            let payload = {
-                let mut payload = PAYLOAD_MUTEX.lock().await;
-                payload.check_sum = payload.calculate_checksum();
-                *payload
-            };
-            let payload_bytes = payload.to_bytes();
+                let _ = uart.write_async(&payload_bytes).await;
+                let _ = uart.flush();
 
-            let _ = uart.write_async(&payload_bytes).await;
-            let _ = uart.flush();
-
-            aux_pin.wait_for_high().await;
-            last_tx = Instant::now();
+                aux_pin.wait_for_high().await;
+            }
         }
     }
 }

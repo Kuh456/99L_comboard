@@ -42,7 +42,7 @@ async fn main(spawner0: Spawner) -> ! {
     let peripherals = esp_hal::init(config);
 
     static APP_CORE_STACK: StaticCell<Stack<8192>> = StaticCell::new();
-    let app_core_stack = APP_CORE_STACK.init(Stack::new());
+    let app_core_stack = APP_CORE_STACK.init_with(Stack::new);
     let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
@@ -63,6 +63,38 @@ async fn main(spawner0: Spawner) -> ! {
 
     m0.set_low();
     m1.set_low();
+    // --- SPI ---
+    let mut spi_bus = Spi::new(
+        peripherals.SPI2,
+        spi::master::Config::default()
+            .with_frequency(Rate::from_khz(400))
+            .with_mode(spi::Mode::_0),
+    )
+    .unwrap()
+    .with_sck(peripherals.GPIO41)
+    .with_mosi(peripherals.GPIO42)
+    .with_miso(peripherals.GPIO40);
+    let sd_cs = Output::new(peripherals.GPIO2, Level::High, OutputConfig::default());
+    // SDカードをSPI modeに入れるため、CS High のまま 74 clock 以上送る
+    // 0xFF 10 bytes = 80 clocks
+    spi_bus.write(&[0xFF; 10]).unwrap();
+
+    // --- init sd ---
+    let spi_dev = ExclusiveDevice::new(spi_bus, sd_cs, Delay).unwrap();
+    let rtc = Rtc::new(peripherals.LPWR);
+    let sd_timer = SdTimeSource::new(rtc);
+    let sdcard = SdCard::new(spi_dev, Delay);
+    match sdcard.num_bytes() {
+        Ok(sd_size) => println!("SD Card Size: {} bytes", sd_size),
+        Err(e) => println!("Failed to get SD Card size: {:?}", e),
+    }
+    static VOLUME_MGR: StaticCell<
+        VolumeManager<
+            SdCard<ExclusiveDevice<Spi<'static, Blocking>, Output<'static>, Delay>, Delay>,
+            SdTimeSource,
+        >,
+    > = StaticCell::new();
+    let volume_mgr = VOLUME_MGR.init(VolumeManager::new(sdcard, sd_timer));
 
     let uart_config1 = UartConfig::default()
         .with_baudrate(9600)
@@ -111,7 +143,7 @@ async fn main(spawner0: Spawner) -> ! {
                 let (_rx, _tx) = can.split();
 
                 let uart_config2 = UartConfig::default()
-                    .with_baudrate(9600)
+                    .with_baudrate(115200)
                     .with_data_bits(DataBits::_8)
                     .with_parity(Parity::None)
                     .with_stop_bits(StopBits::_1);
