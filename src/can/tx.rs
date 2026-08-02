@@ -14,11 +14,19 @@ pub enum CanFrameError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CanTxError {
-    TxInhibited,
     FrameCreateFailed,
     TransmitFailed,
     TimedOutUnknownState,
     BusOff,
+}
+
+pub async fn transmit_message_with_timeout(
+    can: &mut twai::Twai<'static, Async>,
+    message: ComboardCanMessage,
+    timeout: Duration,
+) -> Result<(), CanTxError> {
+    let frame = create_frame_from_message(message).map_err(|_| CanTxError::FrameCreateFailed)?;
+    transmit_frame_with_timeout(can, &frame, timeout).await
 }
 
 pub fn create_frame_from_message(msg: ComboardCanMessage) -> Result<EspTwaiFrame, CanFrameError> {

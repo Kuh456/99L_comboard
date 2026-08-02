@@ -12,8 +12,8 @@ use core::sync::atomic::Ordering;
 use c99l_comboard::{
     state::IS_CAN_ERROR,
     tasks::{
-        SdTimeSource, SdVolumeManager, command_process_task, gnss_manager_task, lora_task,
-        parse_gnss_task, sd_write_task,
+        SdTimeSource, SdVolumeManager, can_communication_task, command_process_task,
+        gnss_manager_task, lora_task, parse_gnss_task, sd_write_task,
     },
 };
 use embassy_executor::Spawner;
@@ -156,7 +156,6 @@ async fn main(spawner0: Spawner) -> ! {
                     SingleStandardFilter::new(b"0xxxxxxxxxx", b"x", [b"xxxxxxxx", b"xxxxxxxx"])
                 });
                 let can = can_config.start();
-                let (_rx, _tx) = can.split();
 
                 let uart_config2 = UartConfig::default()
                     .with_baudrate(115200)
@@ -169,13 +168,7 @@ async fn main(spawner0: Spawner) -> ! {
                     .with_tx(lora_tx)
                     .into_async();
 
-                // CANタスクを有効化する場合は _rx/_tx を rx/tx に戻して spawn する。
-                // spawner
-                //     .spawn(can_receive_task(rx))
-                //     .expect("can_receive_task should spawn during setup");
-                // spawner
-                //     .spawn(can_transmit_task(tx))
-                //     .expect("can_transmit_task should spawn during setup");
+                spawner.spawn(can_communication_task(can).unwrap());
                 spawner.spawn(command_process_task().unwrap());
                 spawner.spawn(parse_gnss_task().unwrap());
                 spawner.spawn(lora_task(uart2, aux_pin).unwrap());

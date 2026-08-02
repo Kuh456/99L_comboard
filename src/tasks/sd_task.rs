@@ -1,5 +1,6 @@
 use core::{fmt::Write, sync::atomic::Ordering};
 
+use embassy_futures::select::{Either, select};
 use embassy_time::{Delay, Duration, Instant, Ticker};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_sdmmc::{Mode, SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
@@ -8,7 +9,7 @@ use heapless::String;
 
 use crate::{
     constants::{BUF_SIZE, SD_FLUSH_INTERVAL_SECS, SD_LOG_INTERVAL_MS},
-    state::{HAS_UNFLUSHED_DATA, IS_LOGGING, PAYLOAD_MUTEX},
+    state::{HAS_UNFLUSHED_DATA, IS_LOGGING, PAYLOAD_MUTEX, SD_FLUSH_SIGNAL},
 };
 
 type SdSpiDevice = ExclusiveDevice<Spi<'static, Blocking>, Output<'static>, Delay>;
@@ -110,18 +111,23 @@ pub async fn sd_write_task(volume_mgr: &'static mut SdVolumeManager) {
     let mut stop_flush_pending = false;
 
     loop {
-        ticker.next().await;
+        let tick_elapsed = match select(ticker.next(), SD_FLUSH_SIGNAL.wait()).await {
+            Either::First(_) => true,
+            Either::Second(()) => false,
+        };
 
         let is_logging = IS_LOGGING.load(Ordering::Relaxed);
         if is_logging && !prev_is_logging {
-            stop_flush_pending = false;
             esp_println::println!("SD logging started");
         } else if !is_logging && prev_is_logging {
             stop_flush_pending = true;
         }
+        if !tick_elapsed {
+            stop_flush_pending = true;
+        }
         prev_is_logging = is_logging;
 
-        if is_logging {
+        if is_logging && tick_elapsed {
             let payload = { *PAYLOAD_MUTEX.lock().await };
             let mut csv_line: String<256> = String::new();
             if writeln!(
@@ -214,6 +220,6 @@ pub async fn sd_write_task(volume_mgr: &'static mut SdVolumeManager) {
             }
         }
 
-        HAS_UNFLUSHED_DATA.store(tlm_cursor > 0, Ordering::Relaxed);
+        HAS_UNFLUSHED_DATA.store(tlm_cursor > 0 || needs_flush, Ordering::Relaxed);
     }
 }

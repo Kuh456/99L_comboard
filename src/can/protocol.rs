@@ -1,3 +1,4 @@
+pub const CAN_ID_STOP_FIN_CONTROL: u16 = 0x001;
 pub const CAN_ID_EMERGENCY_STOP_PARA: u16 = 0x003;
 pub const CAN_ID_START_SEQUENCE: u16 = 0x005;
 pub const CAN_ID_STOP_SEQUENCE: u16 = 0x00a;
@@ -22,6 +23,7 @@ pub const CAN_ID_INTEGRATED_BOARD_STATUS: u16 = 0x200;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComboardCanMessage {
     // 通信基板 → 他基板
+    StopFinControl { command: u8 },
     EmergencyStopPara { command: u8 },
     StartSequence { command: u8 },
     StopSequence { command: u8 },
@@ -54,6 +56,7 @@ pub enum CanDecodeError {
 impl ComboardCanMessage {
     pub const fn id(&self) -> u16 {
         match self {
+            Self::StopFinControl { .. } => CAN_ID_STOP_FIN_CONTROL,
             Self::EmergencyStopPara { .. } => CAN_ID_EMERGENCY_STOP_PARA,
             Self::StartSequence { .. } => CAN_ID_START_SEQUENCE,
             Self::StopSequence { .. } => CAN_ID_STOP_SEQUENCE,
@@ -75,7 +78,8 @@ impl ComboardCanMessage {
 
     pub const fn dlc(&self) -> usize {
         match self {
-            Self::EmergencyStopPara { .. }
+            Self::StopFinControl { .. }
+            | Self::EmergencyStopPara { .. }
             | Self::StartSequence { .. }
             | Self::StopSequence { .. }
             | Self::OpenPara { .. }
@@ -100,7 +104,8 @@ impl ComboardCanMessage {
         out.fill(0);
 
         match *self {
-            Self::EmergencyStopPara { command }
+            Self::StopFinControl { command }
+            | Self::EmergencyStopPara { command }
             | Self::StartSequence { command }
             | Self::StopSequence { command }
             | Self::OpenPara { command }
@@ -136,6 +141,11 @@ impl ComboardCanMessage {
 
     pub fn decode_standard(id: u16, data: &[u8]) -> Result<Self, CanDecodeError> {
         match id {
+            CAN_ID_STOP_FIN_CONTROL => {
+                require_dlc(id, data, 1)?;
+                Ok(Self::StopFinControl { command: data[0] })
+            }
+
             CAN_ID_EMERGENCY_STOP_PARA => {
                 require_dlc(id, data, 1)?;
                 Ok(Self::EmergencyStopPara { command: data[0] })
@@ -231,7 +241,8 @@ impl ComboardCanMessage {
     pub const fn is_command(&self) -> bool {
         matches!(
             self,
-            Self::EmergencyStopPara { .. }
+            Self::StopFinControl { .. }
+                | Self::EmergencyStopPara { .. }
                 | Self::StartSequence { .. }
                 | Self::StopSequence { .. }
                 | Self::OpenPara { .. }

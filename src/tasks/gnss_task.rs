@@ -18,6 +18,7 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
     let mut read_buf = [0u8; 90];
     let mut line_buf = [0u8; 90];
     let mut line_len = 0;
+    let mut is_on = false;
 
     loop {
         match select(uart.read_async(&mut read_buf), GNSS_CMD_CHANNEL.receive()).await {
@@ -63,6 +64,10 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
             }
             Either::Second(cmd) => match cmd {
                 GnssCommand::TurnOn => {
+                    if is_on {
+                        continue;
+                    }
+
                     gnss_en.set_high();
 
                     let config_9600 = UartConfig::default().with_baudrate(9600);
@@ -80,9 +85,11 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                         println!("UART config error (115200baud rate): {:?}", e);
                         continue;
                     }
+                    is_on = true;
                 }
                 GnssCommand::TurnOff => {
                     gnss_en.set_low();
+                    is_on = false;
                 }
             },
         }

@@ -1,11 +1,11 @@
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
 
 use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, mutex::Mutex, signal::Signal,
 };
 use embassy_time::Instant;
 
-use crate::payload::Payload;
+use crate::{can::protocol::ComboardCanMessage, payload::Payload};
 
 pub type GnssPacket = [u8; 90];
 
@@ -25,6 +25,12 @@ pub static RECEIVED_DATA_CHANNEL: Channel<CriticalSectionRawMutex, u8, 10> = Cha
 pub static PAYLOAD_MUTEX: Mutex<CriticalSectionRawMutex, Payload> = Mutex::new(Payload::new());
 pub static IS_LOGGING: AtomicBool = AtomicBool::new(false);
 pub static HAS_UNFLUSHED_DATA: AtomicBool = AtomicBool::new(false);
-pub static CAN_TX_CHANNEL: Channel<CriticalSectionRawMutex, (u16, u8), 5> = Channel::new();
+pub static SD_FLUSH_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+pub static CAN_TX_CHANNEL: Channel<CriticalSectionRawMutex, ComboardCanMessage, 5> = Channel::new();
 pub static IS_CAN_ERROR: AtomicBool = AtomicBool::new(true);
+pub static CAN_TEC: AtomicU8 = AtomicU8::new(0);
+pub static CAN_REC: AtomicU8 = AtomicU8::new(0);
+pub static CAN_HEALTH: AtomicU8 = AtomicU8::new(0);
+pub static CAN_TX_ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static CAN_RX_ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static GNSS_CMD_CHANNEL: Channel<CriticalSectionRawMutex, GnssCommand, 2> = Channel::new();

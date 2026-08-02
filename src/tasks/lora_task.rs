@@ -6,26 +6,22 @@ use esp_hal::{Async, gpio::Input, uart::Uart};
 use esp_println::println;
 
 use crate::{
-    constants::{
-        CAN_ID_CLOSE_PARA, CAN_ID_EMERGENCY_STOP_PARA, CAN_ID_OPEN_PARA, CAN_ID_START_LOGGING,
-        CAN_ID_START_SEQUENCE, CAN_ID_STOP_LOGGING, CAN_ID_STOP_SEQUENCE,
-        LORA_TRANSMIT_INTERVAL_MS,
-    },
+    can::protocol::ComboardCanMessage,
+    constants::LORA_TRANSMIT_INTERVAL_MS,
     state::{
         CAN_TX_CHANNEL, GNSS_CMD_CHANNEL, GnssCommand, IS_LOGGING, LAST_SEEN_LOG, PAYLOAD_MUTEX,
-        RECEIVED_DATA_CHANNEL, TRIGGER_SIGNAL,
+        RECEIVED_DATA_CHANNEL, SD_FLUSH_SIGNAL, TRIGGER_SIGNAL,
     },
 };
 
-const fn get_target_can_id(cmd: u8) -> Option<u16> {
+const fn get_target_can_message(cmd: u8) -> Option<ComboardCanMessage> {
     match cmd {
-        b'q' => Some(CAN_ID_STOP_SEQUENCE),
-        b's' => Some(CAN_ID_START_SEQUENCE),
-        b'c' => Some(CAN_ID_CLOSE_PARA),
-        b'o' => Some(CAN_ID_OPEN_PARA),
-        b'l' => Some(CAN_ID_START_LOGGING),
-        b'm' => Some(CAN_ID_STOP_LOGGING),
-        b'z' => Some(CAN_ID_EMERGENCY_STOP_PARA),
+        b'q' => Some(ComboardCanMessage::StopSequence { command: cmd }),
+        b's' => Some(ComboardCanMessage::StartSequence { command: cmd }),
+        b'l' => Some(ComboardCanMessage::StartLogging { command: cmd }),
+        b'm' => Some(ComboardCanMessage::StopLogging { command: cmd }),
+        b'z' => Some(ComboardCanMessage::EmergencyStopPara { command: cmd }),
+        b'E' => Some(ComboardCanMessage::StopFinControl { command: cmd }),
         _ => None,
     }
 }
@@ -37,26 +33,30 @@ pub async fn command_process_task() {
 
         match command {
             b's' => {
-                IS_LOGGING.store(true, Ordering::Relaxed);
                 GNSS_CMD_CHANNEL.send(GnssCommand::TurnOn).await;
+                IS_LOGGING.store(true, Ordering::Relaxed);
                 let mut payload = PAYLOAD_MUTEX.lock().await;
                 payload.status = (payload.status & 0b1101_1111) | 0b0010_0000;
             }
             b'q' => {
                 IS_LOGGING.store(false, Ordering::Relaxed);
+                SD_FLUSH_SIGNAL.signal(());
                 GNSS_CMD_CHANNEL.send(GnssCommand::TurnOff).await;
                 let mut payload = PAYLOAD_MUTEX.lock().await;
                 payload.status &= 0b1101_1111;
             }
             b'l' => IS_LOGGING.store(true, Ordering::Relaxed),
-            b'm' => IS_LOGGING.store(false, Ordering::Relaxed),
+            b'm' => {
+                IS_LOGGING.store(false, Ordering::Relaxed);
+                SD_FLUSH_SIGNAL.signal(());
+            }
             b'g' => GNSS_CMD_CHANNEL.send(GnssCommand::TurnOn).await,
             b'h' => GNSS_CMD_CHANNEL.send(GnssCommand::TurnOff).await,
             _ => {}
         }
 
-        if let Some(can_id) = get_target_can_id(command) {
-            CAN_TX_CHANNEL.send((can_id, command)).await;
+        if let Some(message) = get_target_can_message(command) {
+            CAN_TX_CHANNEL.send(message).await;
         }
     }
 }
