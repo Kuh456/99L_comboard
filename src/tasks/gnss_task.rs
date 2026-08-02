@@ -10,7 +10,7 @@ use esp_println::println;
 use crate::{
     gnss::{gnss_setting, parse_gga},
     payload::{decode_height_10m_i16, encode_height_10m_i16},
-    state::{GNSS_CHANNEL, GNSS_CMD_CHANNEL, GnssCommand, PAYLOAD_MUTEX, RAW_GNSS_CHANNEL},
+    state::{GNSS_CHANNEL, GNSS_CMD_CHANNEL, GnssCommand, PAYLOAD_MUTEX},
 };
 
 #[embassy_executor::task]
@@ -46,10 +46,6 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                             if GNSS_CHANNEL.try_send(send_buf).is_err() {
                                 let _ = GNSS_CHANNEL.try_receive();
                                 let _ = GNSS_CHANNEL.try_send(send_buf);
-                            }
-                            if RAW_GNSS_CHANNEL.try_send(send_buf).is_err() {
-                                let _ = RAW_GNSS_CHANNEL.try_receive();
-                                let _ = RAW_GNSS_CHANNEL.try_send(send_buf);
                             }
                         }
                         line_len = 0;

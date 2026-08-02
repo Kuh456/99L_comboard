@@ -23,7 +23,6 @@ pub static TRIGGER_SIGNAL: Signal<CriticalSectionRawMutex, bool> = Signal::new()
 pub static GNSS_CHANNEL: Channel<CriticalSectionRawMutex, GnssPacket, 5> = Channel::new();
 pub static RECEIVED_DATA_CHANNEL: Channel<CriticalSectionRawMutex, u8, 10> = Channel::new();
 pub static PAYLOAD_MUTEX: Mutex<CriticalSectionRawMutex, Payload> = Mutex::new(Payload::new());
-pub static RAW_GNSS_CHANNEL: Channel<CriticalSectionRawMutex, GnssPacket, 30> = Channel::new();
 pub static IS_LOGGING: AtomicBool = AtomicBool::new(false);
 pub static HAS_UNFLUSHED_DATA: AtomicBool = AtomicBool::new(false);
 pub static CAN_TX_CHANNEL: Channel<CriticalSectionRawMutex, (u16, u8), 5> = Channel::new();

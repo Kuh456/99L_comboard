@@ -7,30 +7,25 @@ use esp_println::println;
 
 use crate::{
     constants::{
-        CAN_ID_EMERGENCY_STOP_PARA, CAN_ID_ERASE_FLASH, CAN_ID_POWER_OFF_CAMERA,
-        CAN_ID_POWER_ON_CAMERA, CAN_ID_START_LOGGING, CAN_ID_START_RECORDING,
-        CAN_ID_START_SEQUENCE, CAN_ID_STOP_LOGGING, CAN_ID_STOP_RECORDING, CAN_ID_STOP_SEQUENCE,
+        CAN_ID_CLOSE_PARA, CAN_ID_EMERGENCY_STOP_PARA, CAN_ID_OPEN_PARA, CAN_ID_START_LOGGING,
+        CAN_ID_START_SEQUENCE, CAN_ID_STOP_LOGGING, CAN_ID_STOP_SEQUENCE,
         LORA_TRANSMIT_INTERVAL_MS,
     },
     state::{
-        CAN_TX_CHANNEL, GNSS_CMD_CHANNEL, GnssCommand, IS_LOGGING, LAST_SEEN_CAMERA, LAST_SEEN_LOG,
-        PAYLOAD_MUTEX, RECEIVED_DATA_CHANNEL, TRIGGER_SIGNAL,
+        CAN_TX_CHANNEL, GNSS_CMD_CHANNEL, GnssCommand, IS_LOGGING, LAST_SEEN_LOG, PAYLOAD_MUTEX,
+        RECEIVED_DATA_CHANNEL, TRIGGER_SIGNAL,
     },
 };
 
 const fn get_target_can_id(cmd: u8) -> Option<u16> {
     match cmd {
-        b'e' => Some(CAN_ID_STOP_SEQUENCE),
+        b'q' => Some(CAN_ID_STOP_SEQUENCE),
         b's' => Some(CAN_ID_START_SEQUENCE),
-        // b'p' => Some(CAN_ID_ACTUATE_PARA),
-        b'x' => Some(CAN_ID_ERASE_FLASH),
+        b'c' => Some(CAN_ID_CLOSE_PARA),
+        b'o' => Some(CAN_ID_OPEN_PARA),
         b'l' => Some(CAN_ID_START_LOGGING),
         b'm' => Some(CAN_ID_STOP_LOGGING),
-        b'c' => Some(CAN_ID_START_RECORDING),
-        b'v' => Some(CAN_ID_STOP_RECORDING),
-        b'i' => Some(CAN_ID_POWER_ON_CAMERA),
-        b'o' => Some(CAN_ID_POWER_OFF_CAMERA),
-        b'a' => Some(CAN_ID_EMERGENCY_STOP_PARA),
+        b'z' => Some(CAN_ID_EMERGENCY_STOP_PARA),
         _ => None,
     }
 }
@@ -47,7 +42,7 @@ pub async fn command_process_task() {
                 let mut payload = PAYLOAD_MUTEX.lock().await;
                 payload.status = (payload.status & 0b1101_1111) | 0b0010_0000;
             }
-            b'e' => {
+            b'q' => {
                 IS_LOGGING.store(false, Ordering::Relaxed);
                 GNSS_CMD_CHANNEL.send(GnssCommand::TurnOff).await;
                 let mut payload = PAYLOAD_MUTEX.lock().await;
@@ -120,13 +115,6 @@ pub async fn create_lora_payload() {
             if is_timeout(*LAST_SEEN_LOG.lock().await) {
                 payload.status &= 0b1111_0111;
             }
-            if is_timeout(*LAST_SEEN_CAMERA.lock().await) {
-                payload.status &= 0b1110_1111;
-            }
-            // if is_timeout(*LAST_SEEN_POWER.lock().await) {
-            //     payload.status &= 0b1101_1111;
-            // }
-
             payload.check_sum = payload.calculate_checksum();
         }
 

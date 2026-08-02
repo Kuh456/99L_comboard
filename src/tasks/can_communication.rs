@@ -11,8 +11,7 @@ use esp_println::println;
 
 use crate::{
     constants::{
-        CAN_ID_ACCELARATION, CAN_ID_AIR_PRESSURE, CAN_ID_ANGLE_SPEED, CAN_ID_LIFT_OFF,
-        CAN_ID_TEST_TO_CAMERA, CAN_ID_TEST_TO_LOG_PARA, CAN_ID_TOP,
+        CAN_ID_ACCELERATION, CAN_ID_AIR_PRESSURE, CAN_ID_ANGLE_SPEED, CAN_ID_LIFT_OFF, CAN_ID_TOP,
     },
     state::{CAN_TX_CHANNEL, IS_CAN_ERROR, PAYLOAD_MUTEX, TRIGGER_SIGNAL},
 };
@@ -96,7 +95,7 @@ pub async fn can_receive_task(mut rx: twai::TwaiRx<'static, Async>) {
                             }
                         }
                     }
-                    Id::Standard(s_id) if s_id.as_raw() == CAN_ID_ACCELARATION => {
+                    Id::Standard(s_id) if s_id.as_raw() == CAN_ID_ACCELERATION => {
                         if payload.data().len() >= 6 {
                             let mut acceleration = [0u8; 6];
                             acceleration.copy_from_slice(&payload.data()[0..6]);

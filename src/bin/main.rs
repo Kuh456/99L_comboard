@@ -11,20 +11,29 @@ use core::sync::atomic::Ordering;
 
 use c99l_comboard::{
     state::IS_CAN_ERROR,
-    tasks::{command_process_task, gnss_manager_task, lora_task, parse_gnss_task},
+    tasks::{
+        SdTimeSource, SdVolumeManager, command_process_task, gnss_manager_task, lora_task,
+        parse_gnss_task, sd_write_task,
+    },
 };
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Delay, Duration, Timer};
+use embedded_hal_bus::spi::ExclusiveDevice;
+use embedded_sdmmc::{SdCard, VolumeManager};
 use esp_backtrace as _;
 use esp_hal::{
     clock::CpuClock,
     gpio::{Input, InputConfig, Level, Output, OutputConfig},
     interrupt::software::SoftwareInterruptControl,
+    rtc_cntl::Rtc,
+    spi::{self, master::Spi},
     system::Stack,
+    time::Rate,
     timer::timg::TimerGroup,
     twai::{self, BaudRate, TwaiMode, filter::SingleStandardFilter},
     uart::{Config as UartConfig, DataBits, Parity, StopBits, Uart},
 };
+use esp_println::println;
 use esp_rtos::embassy::Executor;
 use static_cell::StaticCell;
 
@@ -41,7 +50,7 @@ async fn main(spawner0: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    static APP_CORE_STACK: StaticCell<Stack<8192>> = StaticCell::new();
+    static APP_CORE_STACK: StaticCell<Stack<16384>> = StaticCell::new();
     let app_core_stack = APP_CORE_STACK.init_with(Stack::new);
     let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
 
@@ -85,15 +94,21 @@ async fn main(spawner0: Spawner) -> ! {
     let sd_timer = SdTimeSource::new(rtc);
     let sdcard = SdCard::new(spi_dev, Delay);
     match sdcard.num_bytes() {
-        Ok(sd_size) => println!("SD Card Size: {} bytes", sd_size),
-        Err(e) => println!("Failed to get SD Card size: {:?}", e),
+        Ok(sd_size) => {
+            println!("SD card initialized");
+            println!("SD card size: {} bytes", sd_size);
+
+            let fast_config = spi::master::Config::default()
+                .with_frequency(Rate::from_mhz(1))
+                .with_mode(spi::Mode::_0);
+            match sdcard.spi(|device| device.bus_mut().apply_config(&fast_config)) {
+                Ok(()) => println!("SD SPI frequency set to 1 MHz"),
+                Err(e) => println!("SD SPI frequency change error: {:?}", e),
+            }
+        }
+        Err(e) => println!("SD card initialization/size error: {:?}", e),
     }
-    static VOLUME_MGR: StaticCell<
-        VolumeManager<
-            SdCard<ExclusiveDevice<Spi<'static, Blocking>, Output<'static>, Delay>, Delay>,
-            SdTimeSource,
-        >,
-    > = StaticCell::new();
+    static VOLUME_MGR: StaticCell<SdVolumeManager> = StaticCell::new();
     let volume_mgr = VOLUME_MGR.init(VolumeManager::new(sdcard, sd_timer));
 
     let uart_config1 = UartConfig::default()
@@ -117,7 +132,8 @@ async fn main(spawner0: Spawner) -> ! {
     }
 
     spawner0.spawn(gnss_manager_task(uart1, gnss_en).unwrap());
-    spawner0.spawn(command_process_task().unwrap());
+    // Keep blocking SD traffic off the core reserved for LoRa and optional CAN tasks.
+    spawner0.spawn(sd_write_task(volume_mgr).unwrap());
 
     esp_rtos::start_second_core(
         peripherals.CPU_CTRL,
@@ -160,6 +176,7 @@ async fn main(spawner0: Spawner) -> ! {
                 // spawner
                 //     .spawn(can_transmit_task(tx))
                 //     .expect("can_transmit_task should spawn during setup");
+                spawner.spawn(command_process_task().unwrap());
                 spawner.spawn(parse_gnss_task().unwrap());
                 spawner.spawn(lora_task(uart2, aux_pin).unwrap());
             });
