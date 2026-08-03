@@ -62,22 +62,31 @@ async fn send_cmd(tx: &mut GnssUart, mut data: &[u8]) -> Result<bool, TxError> {
     Ok(true)
 }
 
-pub async fn gnss_setting(tx: &mut GnssUart) {
+#[derive(Debug)]
+pub enum GnssSettingError {
+    NoWriteProgress,
+    Uart(TxError),
+}
+
+pub async fn gnss_setting(tx: &mut GnssUart) -> Result<(), GnssSettingError> {
     for &cmd in INIT_COMMANDS {
         match send_cmd(tx, cmd).await {
             Ok(true) => {}
             Ok(false) => {
                 println!("GNSS UART write made no progress");
-                return;
+                return Err(GnssSettingError::NoWriteProgress);
             }
             Err(error) => {
                 println!("GNSS UART write error: {:?}", error);
-                return;
+                return Err(GnssSettingError::Uart(error));
             }
         }
     }
 
     if let Err(error) = tx.flush_async().await {
         println!("GNSS UART flush error: {:?}", error);
+        return Err(GnssSettingError::Uart(error));
     }
+
+    Ok(())
 }

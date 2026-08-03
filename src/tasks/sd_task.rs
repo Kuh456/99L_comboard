@@ -9,7 +9,10 @@ use heapless::String;
 
 use crate::{
     constants::{BUF_SIZE, SD_FLUSH_INTERVAL_SECS, SD_LOG_INTERVAL_MS},
-    state::{HAS_UNFLUSHED_DATA, IS_LOGGING, PAYLOAD_MUTEX, SD_FLUSH_SIGNAL},
+    state::{
+        HAS_UNFLUSHED_DATA, LOGGING_ACTIVE, LOGGING_REQUESTED, PAYLOAD_MUTEX, SD_DROPPED_ROW_COUNT,
+        SD_FLUSH_SIGNAL, SD_HAS_ERROR, SD_WRITE_ERROR_COUNT,
+    },
 };
 
 type SdSpiDevice = ExclusiveDevice<Spi<'static, Blocking>, Output<'static>, Delay>;
@@ -54,6 +57,8 @@ impl TimeSource for SdTimeSource {
 
 #[embassy_executor::task]
 pub async fn sd_write_task(volume_mgr: &'static mut SdVolumeManager) {
+    LOGGING_ACTIVE.store(false, Ordering::Relaxed);
+    SD_HAS_ERROR.store(false, Ordering::Relaxed);
     let mut tlm_buffer = [0u8; BUF_SIZE];
     let mut tlm_cursor = 0usize;
     let mut bytes_since_flush = 0usize;
@@ -63,6 +68,7 @@ pub async fn sd_write_task(volume_mgr: &'static mut SdVolumeManager) {
         Ok(volume) => volume,
         Err(e) => {
             esp_println::println!("SD open_volume error: {:?}", e);
+            SD_HAS_ERROR.store(true, Ordering::Relaxed);
             return;
         }
     };
@@ -70,6 +76,7 @@ pub async fn sd_write_task(volume_mgr: &'static mut SdVolumeManager) {
         Ok(dir) => dir,
         Err(e) => {
             esp_println::println!("SD open_root_dir error: {:?}", e);
+            SD_HAS_ERROR.store(true, Ordering::Relaxed);
             return;
         }
     };
@@ -80,6 +87,7 @@ pub async fn sd_write_task(volume_mgr: &'static mut SdVolumeManager) {
         }
         Err(e) => {
             esp_println::println!("SD open_file_in_dir TLM.CSV error: {:?}", e);
+            SD_HAS_ERROR.store(true, Ordering::Relaxed);
             return;
         }
     };
@@ -90,6 +98,8 @@ pub async fn sd_write_task(volume_mgr: &'static mut SdVolumeManager) {
             Ok(()) => {}
             Err(e) => {
                 esp_println::println!("SD TLM header write error: {:?}", e);
+                SD_HAS_ERROR.store(true, Ordering::Relaxed);
+                SD_WRITE_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
                 return;
             }
         }
@@ -97,11 +107,14 @@ pub async fn sd_write_task(volume_mgr: &'static mut SdVolumeManager) {
             Ok(()) => esp_println::println!("TLM header written"),
             Err(e) => {
                 esp_println::println!("SD TLM header flush error: {:?}", e);
+                SD_HAS_ERROR.store(true, Ordering::Relaxed);
+                SD_WRITE_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
                 return;
             }
         }
     } else if let Err(e) = tlm_file.seek_from_end(0) {
         esp_println::println!("SD TLM seek_from_end error: {:?}", e);
+        SD_HAS_ERROR.store(true, Ordering::Relaxed);
         return;
     }
 
@@ -116,7 +129,11 @@ pub async fn sd_write_task(volume_mgr: &'static mut SdVolumeManager) {
             Either::Second(()) => false,
         };
 
-        let is_logging = IS_LOGGING.load(Ordering::Relaxed);
+        let is_logging = LOGGING_REQUESTED.load(Ordering::Relaxed);
+        LOGGING_ACTIVE.store(
+            is_logging && !SD_HAS_ERROR.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         if is_logging && !prev_is_logging {
             esp_println::println!("SD logging started");
         } else if !is_logging && prev_is_logging {
@@ -156,6 +173,7 @@ pub async fn sd_write_task(volume_mgr: &'static mut SdVolumeManager) {
             .is_err()
             {
                 esp_println::println!("TLM CSV line formatting overflow");
+                SD_DROPPED_ROW_COUNT.fetch_add(1, Ordering::Relaxed);
             } else {
                 let line_bytes = csv_line.as_bytes();
 
@@ -168,6 +186,8 @@ pub async fn sd_write_task(volume_mgr: &'static mut SdVolumeManager) {
                         }
                         Err(e) => {
                             esp_println::println!("SD TLM buffer-full write error: {:?}", e);
+                            SD_HAS_ERROR.store(true, Ordering::Relaxed);
+                            SD_WRITE_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -182,6 +202,7 @@ pub async fn sd_write_task(volume_mgr: &'static mut SdVolumeManager) {
                         tlm_cursor,
                         BUF_SIZE
                     );
+                    SD_DROPPED_ROW_COUNT.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -196,7 +217,11 @@ pub async fn sd_write_task(volume_mgr: &'static mut SdVolumeManager) {
                         tlm_cursor = 0;
                         needs_flush = true;
                     }
-                    Err(e) => esp_println::println!("SD TLM write error: {:?}", e),
+                    Err(e) => {
+                        esp_println::println!("SD TLM write error: {:?}", e);
+                        SD_HAS_ERROR.store(true, Ordering::Relaxed);
+                        SD_WRITE_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
 
@@ -213,7 +238,11 @@ pub async fn sd_write_task(volume_mgr: &'static mut SdVolumeManager) {
                             esp_println::println!("SD logging stopped and flushed");
                         }
                     }
-                    Err(e) => esp_println::println!("SD TLM flush error: {:?}", e),
+                    Err(e) => {
+                        esp_println::println!("SD TLM flush error: {:?}", e);
+                        SD_HAS_ERROR.store(true, Ordering::Relaxed);
+                        SD_WRITE_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             } else if periodic_flush_due {
                 last_flush = Instant::now();

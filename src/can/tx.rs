@@ -4,7 +4,7 @@ use esp_hal::{
     twai::{self, EspTwaiError, EspTwaiFrame, StandardId},
 };
 
-use super::protocol::ComboardCanMessage;
+use super::protocol::CanTxMessage;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CanFrameError {
@@ -22,14 +22,14 @@ pub enum CanTxError {
 
 pub async fn transmit_message_with_timeout(
     can: &mut twai::Twai<'static, Async>,
-    message: ComboardCanMessage,
+    message: CanTxMessage,
     timeout: Duration,
 ) -> Result<(), CanTxError> {
     let frame = create_frame_from_message(message).map_err(|_| CanTxError::FrameCreateFailed)?;
     transmit_frame_with_timeout(can, &frame, timeout).await
 }
 
-pub fn create_frame_from_message(msg: ComboardCanMessage) -> Result<EspTwaiFrame, CanFrameError> {
+pub fn create_frame_from_message(msg: CanTxMessage) -> Result<EspTwaiFrame, CanFrameError> {
     let mut payload = [0u8; 8];
     let len = msg.encode_payload(&mut payload);
     let id = StandardId::new(msg.id()).ok_or(CanFrameError::InvalidId(msg.id()))?;

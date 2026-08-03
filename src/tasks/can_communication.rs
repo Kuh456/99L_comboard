@@ -14,7 +14,8 @@ use crate::{
         command::CommandRequestState,
         health::{CanHealth, classify_can_health},
         protocol::{
-            ComboardCanMessage, ControllerStatus, ControllerStatusFlags, controller_status_effects,
+            CanRxMessage, ControllerLinkState, ControllerStatus, ControllerStatusFlags,
+            controller_status_effects,
         },
         tx::{CanTxError, transmit_message_with_timeout},
     },
@@ -25,8 +26,9 @@ use crate::{
     state::{
         CAN_HEALTH, CAN_REC, CAN_RX_ERROR_COUNT, CAN_TEC, CAN_TX_CHANNEL, CAN_TX_ERROR_COUNT,
         COMMAND_REQUEST_FAILURE_COUNT, COMMAND_REQUEST_STATE, CONTROLLER_STATUS_RAW,
-        CONTROLLER_STATUS_RX_COUNT, GNSS_CMD_CHANNEL, GnssCommand, HAS_VALID_CONTROLLER_STATUS,
-        IS_CAN_ERROR, IS_LOGGING, LAST_COMMAND_FAILURE, LAST_SEEN_CONTROLLER, PAYLOAD_MUTEX,
+        CONTROLLER_STATUS_RX_COUNT, CONTROLLER_STATUS_STATE, FIN_ANGLE_DROPPED_COUNT,
+        GNSS_CMD_CHANNEL, GnssCommand, HAS_VALID_CONTROLLER_STATUS, IS_CAN_ERROR,
+        LAST_COMMAND_FAILURE, LEGACY_LIFTOFF_TOP_RX_COUNT, LOGGING_REQUESTED, PAYLOAD_MUTEX,
         SD_FLUSH_SIGNAL, TRIGGER_SIGNAL,
     },
 };
@@ -127,36 +129,31 @@ fn publish_error_state(
     );
 }
 
-async fn apply_received_message(message: ComboardCanMessage) {
+async fn apply_received_message(message: CanRxMessage) {
     match message {
-        ComboardCanMessage::LiftOff { .. } | ComboardCanMessage::Top { .. } => {}
-        ComboardCanMessage::AngleSpeed { xyz } => {
+        CanRxMessage::LiftOff { .. } | CanRxMessage::Top { .. } => {
+            LEGACY_LIFTOFF_TOP_RX_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        CanRxMessage::AngleSpeed { xyz } => {
             PAYLOAD_MUTEX.lock().await.angle_speed = xyz;
         }
-        ComboardCanMessage::Acceleration { xyz } => {
+        CanRxMessage::Acceleration { xyz } => {
             PAYLOAD_MUTEX.lock().await.acceleration = xyz;
         }
-        ComboardCanMessage::AirPressure { bytes } => {
+        CanRxMessage::AirPressure { bytes } => {
             PAYLOAD_MUTEX.lock().await.air_pressure = bytes;
         }
-        ComboardCanMessage::AccumulatedAngle { xyz } => {
+        CanRxMessage::AccumulatedAngle { xyz } => {
             PAYLOAD_MUTEX.lock().await.integrated_angle = xyz;
         }
         // The protocol contains three i16 fin values, while Payload has one i8
         // field. Do not guess which value or narrowing rule should be used.
-        ComboardCanMessage::FinAngle { .. } => {}
-        ComboardCanMessage::ControllerStatus { status } => {
-            apply_controller_status(status).await;
+        CanRxMessage::FinAngle { .. } => {
+            FIN_ANGLE_DROPPED_COUNT.fetch_add(1, Ordering::Relaxed);
         }
-        // Command frames are transmitted by this board and have no RX side effect.
-        ComboardCanMessage::StopFinControl { .. }
-        | ComboardCanMessage::EmergencyStopPara { .. }
-        | ComboardCanMessage::StartSequence { .. }
-        | ComboardCanMessage::StopSequence { .. }
-        | ComboardCanMessage::OpenPara { .. }
-        | ComboardCanMessage::ClosePara { .. }
-        | ComboardCanMessage::StartLogging { .. }
-        | ComboardCanMessage::StopLogging { .. } => {}
+        CanRxMessage::ControllerStatus { status } => {
+            apply_controller_status(status).await;
+        } // Command frames are transmitted by this board and have no RX side effect.
     }
 }
 
@@ -172,7 +169,12 @@ fn previous_controller_status() -> Option<ControllerStatusFlags> {
 }
 
 async fn apply_controller_status(status: ControllerStatus) {
-    *LAST_SEEN_CONTROLLER.lock().await = Some(Instant::now());
+    {
+        let mut controller = CONTROLLER_STATUS_STATE.lock().await;
+        controller.status = Some(status);
+        controller.last_seen = Some(Instant::now());
+        controller.link = ControllerLinkState::Online;
+    }
     CONTROLLER_STATUS_RX_COUNT.fetch_add(1, Ordering::Relaxed);
 
     let ControllerStatus::Valid(status) = status else {
@@ -187,7 +189,7 @@ async fn apply_controller_status(status: ControllerStatus) {
     PAYLOAD_MUTEX.lock().await.status = status.raw();
 
     if let Some(sequence_active) = effects.sequence_changed {
-        IS_LOGGING.store(sequence_active, Ordering::Relaxed);
+        LOGGING_REQUESTED.store(sequence_active, Ordering::Relaxed);
         let gnss_command = if sequence_active {
             GnssCommand::TurnOn
         } else {
@@ -267,7 +269,7 @@ async fn handle_received_frame(frame: EspTwaiFrame) {
         }
     };
 
-    match ComboardCanMessage::decode_standard(id, frame.data()) {
+    match CanRxMessage::decode_standard(id, frame.data()) {
         Ok(message) => apply_received_message(message).await,
         Err(error) => {
             CAN_RX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);

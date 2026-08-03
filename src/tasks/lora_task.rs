@@ -10,43 +10,28 @@ use esp_hal::{
 use esp_println::println;
 
 use crate::{
-    can::{command::GroundCommand, protocol::ComboardCanMessage},
+    can::{command::GroundCommand, protocol::CanTxMessage},
     constants::{LORA_AUX_TIMEOUT_MS, LORA_TRANSMIT_INTERVAL_MS},
     state::{
         CAN_TX_CHANNEL, COMMAND_REQUEST_FAILURE_COUNT, COMMAND_REQUEST_STATE, CanTxRequest,
-        GNSS_CMD_CHANNEL, GnssCommand, LAST_COMMAND_FAILURE, PAYLOAD_MUTEX, RECEIVED_DATA_CHANNEL,
+        GNSS_CMD_CHANNEL, GnssCommand, LAST_COMMAND_FAILURE, LORA_AUX_TIMEOUT_COUNT,
+        LORA_RX_ERROR_COUNT, LORA_TX_ERROR_COUNT, PAYLOAD_MUTEX, RECEIVED_DATA_CHANNEL,
         TRIGGER_SIGNAL,
     },
 };
 
-const fn get_target_can_message(cmd: u8) -> Option<(ComboardCanMessage, Option<GroundCommand>)> {
-    match cmd {
-        b'q' => Some((
-            ComboardCanMessage::StopSequence { command: cmd },
-            Some(GroundCommand::StopSequence),
-        )),
-        b's' => Some((
-            ComboardCanMessage::StartSequence { command: cmd },
-            Some(GroundCommand::StartSequence),
-        )),
-        b'l' => Some((ComboardCanMessage::StartLogging { command: cmd }, None)),
-        b'm' => Some((ComboardCanMessage::StopLogging { command: cmd }, None)),
-        b'z' => Some((
-            ComboardCanMessage::EmergencyStopPara { command: cmd },
-            Some(GroundCommand::EmergencyStop),
-        )),
-        b'E' => Some((ComboardCanMessage::StopFinControl { command: cmd }, None)),
-        b'c' => Some((ComboardCanMessage::ClosePara { command: cmd }, None)),
-        b'o' => Some((ComboardCanMessage::OpenPara { command: cmd }, None)),
-        _ => None,
+const fn get_target_can_message(command: GroundCommand) -> Option<CanTxMessage> {
+    match command {
+        GroundCommand::StopSequence => Some(CanTxMessage::StopSequence { command: b'q' }),
+        GroundCommand::StartSequence => Some(CanTxMessage::StartSequence { command: b's' }),
+        GroundCommand::StartLogging => Some(CanTxMessage::StartLogging { command: b'l' }),
+        GroundCommand::StopLogging => Some(CanTxMessage::StopLogging { command: b'm' }),
+        GroundCommand::EmergencyStopPara => Some(CanTxMessage::EmergencyStopPara { command: b'z' }),
+        GroundCommand::StopFinControl => Some(CanTxMessage::StopFinControl { command: b'E' }),
+        GroundCommand::ClosePara => Some(CanTxMessage::ClosePara { command: b'c' }),
+        GroundCommand::OpenPara => Some(CanTxMessage::OpenPara { command: b'o' }),
+        GroundCommand::GnssOn | GroundCommand::GnssOff => None,
     }
-}
-
-const fn is_supported_command(command: u8) -> bool {
-    matches!(
-        command,
-        b's' | b'q' | b'l' | b'm' | b'g' | b'h' | b'z' | b'E' | b'c' | b'o'
-    )
 }
 
 async fn write_all(uart: &mut Uart<'static, Async>, mut bytes: &[u8]) -> Result<bool, TxError> {
@@ -70,13 +55,18 @@ async fn transmit_latest_payload(uart: &mut Uart<'static, Async>, aux_pin: &mut 
 
     match write_all(uart, &payload_bytes).await {
         Ok(true) => {}
-        Ok(false) => return,
+        Ok(false) => {
+            LORA_TX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         Err(error) => {
+            LORA_TX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
             println!("LoRa UART write error: {:?}", error);
             return;
         }
     }
     if let Err(error) = uart.flush_async().await {
+        LORA_TX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
         println!("LoRa UART flush error: {:?}", error);
         return;
     }
@@ -89,6 +79,7 @@ async fn transmit_latest_payload(uart: &mut Uart<'static, Async>, aux_pin: &mut 
         .await
         .is_err()
     {
+        LORA_AUX_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
         println!("LoRa AUX timeout");
     }
 }
@@ -98,40 +89,42 @@ pub async fn command_process_task() {
     let mut next_tracking_token = 0u32;
 
     loop {
-        let command = RECEIVED_DATA_CHANNEL.receive().await;
+        let Some(command) = GroundCommand::decode_legacy(RECEIVED_DATA_CHANNEL.receive().await)
+        else {
+            continue;
+        };
 
         match command {
-            b'g' => GNSS_CMD_CHANNEL.send(GnssCommand::TurnOn).await,
-            b'h' => GNSS_CMD_CHANNEL.send(GnssCommand::TurnOff).await,
+            GroundCommand::GnssOn => GNSS_CMD_CHANNEL.send(GnssCommand::TurnOn).await,
+            GroundCommand::GnssOff => GNSS_CMD_CHANNEL.send(GnssCommand::TurnOff).await,
             _ => {}
         }
 
-        if let Some((message, tracked_command)) = get_target_can_message(command) {
-            let request = match tracked_command {
-                Some(tracked_command) => {
-                    next_tracking_token = next_tracking_token.wrapping_add(1);
-                    let superseded = {
-                        let mut state = COMMAND_REQUEST_STATE.lock().await;
-                        let superseded = if state.is_in_flight() {
-                            *state = state.supersede();
-                            state.failure()
-                        } else {
-                            None
-                        };
-                        *state = crate::can::command::CommandRequestState::queue(
-                            next_tracking_token,
-                            tracked_command,
-                        );
-                        superseded
+        if let Some(message) = get_target_can_message(command) {
+            let request = if command.is_confirmed_by_controller_status() {
+                next_tracking_token = next_tracking_token.wrapping_add(1);
+                let superseded = {
+                    let mut state = COMMAND_REQUEST_STATE.lock().await;
+                    let superseded = if state.is_in_flight() {
+                        *state = state.supersede();
+                        state.failure()
+                    } else {
+                        None
                     };
-                    if let Some(superseded) = superseded {
-                        *LAST_COMMAND_FAILURE.lock().await = Some(superseded);
-                        COMMAND_REQUEST_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
-                        println!("superseding pending CAN command");
-                    }
-                    CanTxRequest::tracked(message, next_tracking_token)
+                    *state = crate::can::command::CommandRequestState::queue(
+                        next_tracking_token,
+                        command,
+                    );
+                    superseded
+                };
+                if let Some(superseded) = superseded {
+                    *LAST_COMMAND_FAILURE.lock().await = Some(superseded);
+                    COMMAND_REQUEST_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
+                    println!("superseding pending CAN command");
                 }
-                None => CanTxRequest::untracked(message),
+                CanTxRequest::tracked(message, next_tracking_token)
+            } else {
+                CanTxRequest::untracked(message)
             };
             CAN_TX_CHANNEL.send(request).await;
         }
@@ -158,13 +151,14 @@ pub async fn lora_task(mut uart: Uart<'static, Async>, mut aux_pin: Input<'stati
                 if len > 0 {
                     println!("cmd: {:?}", &rx_buf[..len]);
                     for &command in &rx_buf[..len] {
-                        if is_supported_command(command) {
+                        if GroundCommand::decode_legacy(command).is_some() {
                             RECEIVED_DATA_CHANNEL.send(command).await;
                         }
                     }
                 }
             }
             Either3::Second(Err(error)) => {
+                LORA_RX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
                 println!("LoRa UART receive error: {:?}", error);
             }
             Either3::Third(_) => {

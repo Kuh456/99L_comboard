@@ -2,7 +2,43 @@
 pub enum GroundCommand {
     StartSequence,
     StopSequence,
-    EmergencyStop,
+    EmergencyStopPara,
+    StartLogging,
+    StopLogging,
+    StopFinControl,
+    OpenPara,
+    ClosePara,
+    GnssOn,
+    GnssOff,
+}
+
+impl GroundCommand {
+    pub const fn decode_legacy(byte: u8) -> Option<Self> {
+        match byte {
+            b's' => Some(Self::StartSequence),
+            b'q' => Some(Self::StopSequence),
+            b'z' => Some(Self::EmergencyStopPara),
+            b'l' => Some(Self::StartLogging),
+            b'm' => Some(Self::StopLogging),
+            b'E' => Some(Self::StopFinControl),
+            b'o' => Some(Self::OpenPara),
+            b'c' => Some(Self::ClosePara),
+            b'g' => Some(Self::GnssOn),
+            b'h' => Some(Self::GnssOff),
+            _ => None,
+        }
+    }
+
+    pub const fn is_confirmed_by_controller_status(self) -> bool {
+        matches!(
+            self,
+            Self::StartSequence | Self::StopSequence | Self::EmergencyStopPara
+        )
+    }
+
+    pub const fn is_safety_critical(self) -> bool {
+        matches!(self, Self::EmergencyStopPara)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,6 +181,13 @@ pub const fn command_completed(
     match command {
         GroundCommand::StartSequence => sequence_active,
         GroundCommand::StopSequence => !sequence_active,
-        GroundCommand::EmergencyStop => !liftoff_detected,
+        GroundCommand::EmergencyStopPara => !liftoff_detected,
+        GroundCommand::StartLogging
+        | GroundCommand::StopLogging
+        | GroundCommand::StopFinControl
+        | GroundCommand::OpenPara
+        | GroundCommand::ClosePara
+        | GroundCommand::GnssOn
+        | GroundCommand::GnssOff => false,
     }
 }

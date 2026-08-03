@@ -20,6 +20,29 @@ pub const CAN_ID_ACCUMULATED_ANGLE: u16 = 0x14a;
 
 pub const CAN_ID_CONTROLLER_STATUS: u16 = 0x200;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControllerLinkState {
+    Unknown,
+    Online,
+    TimedOut,
+}
+
+pub const fn controller_link_state(
+    has_received_status: bool,
+    elapsed_ms: u64,
+    timeout_ms: Option<u64>,
+) -> ControllerLinkState {
+    if !has_received_status {
+        ControllerLinkState::Unknown
+    } else if let Some(timeout_ms) = timeout_ms
+        && elapsed_ms >= timeout_ms
+    {
+        ControllerLinkState::TimedOut
+    } else {
+        ControllerLinkState::Online
+    }
+}
+
 const CONTROLLER_STATUS_RESERVED_MASK: u8 = 1 << 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,8 +138,7 @@ pub const fn controller_status_effects(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ComboardCanMessage {
-    // 通信基板 → 他基板
+pub enum CanTxMessage {
     StopFinControl { command: u8 },
     EmergencyStopPara { command: u8 },
     StartSequence { command: u8 },
@@ -125,8 +147,10 @@ pub enum ComboardCanMessage {
     ClosePara { command: u8 },
     StartLogging { command: u8 },
     StopLogging { command: u8 },
+}
 
-    // 他基板 → 通信基板
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanRxMessage {
     LiftOff { value: u8 },
     Top { value: u8 },
     AngleSpeed { xyz: [i16; 3] },
@@ -147,7 +171,7 @@ pub enum CanDecodeError {
     },
 }
 
-impl ComboardCanMessage {
+impl CanTxMessage {
     pub const fn id(&self) -> u16 {
         match self {
             Self::StopFinControl { .. } => CAN_ID_STOP_FIN_CONTROL,
@@ -158,15 +182,6 @@ impl ComboardCanMessage {
             Self::ClosePara { .. } => CAN_ID_CLOSE_PARA,
             Self::StartLogging { .. } => CAN_ID_START_LOGGING,
             Self::StopLogging { .. } => CAN_ID_STOP_LOGGING,
-
-            Self::LiftOff { .. } => CAN_ID_LIFT_OFF,
-            Self::Top { .. } => CAN_ID_TOP,
-            Self::AngleSpeed { .. } => CAN_ID_ANGLE_SPEED,
-            Self::Acceleration { .. } => CAN_ID_ACCELERATION,
-            Self::AirPressure { .. } => CAN_ID_AIR_PRESSURE,
-            Self::FinAngle { .. } => CAN_ID_FIN_ANGLE,
-            Self::AccumulatedAngle { .. } => CAN_ID_ACCUMULATED_ANGLE,
-            Self::ControllerStatus { .. } => CAN_ID_CONTROLLER_STATUS,
         }
     }
 
@@ -179,17 +194,7 @@ impl ComboardCanMessage {
             | Self::OpenPara { .. }
             | Self::ClosePara { .. }
             | Self::StartLogging { .. }
-            | Self::StopLogging { .. }
-            | Self::LiftOff { .. }
-            | Self::Top { .. }
-            | Self::ControllerStatus { .. } => 1,
-
-            Self::AirPressure { .. } => 3,
-
-            Self::AngleSpeed { .. }
-            | Self::Acceleration { .. }
-            | Self::FinAngle { .. }
-            | Self::AccumulatedAngle { .. } => 6,
+            | Self::StopLogging { .. } => 1,
         }
     }
 
@@ -207,72 +212,15 @@ impl ComboardCanMessage {
             | Self::StopLogging { command } => {
                 out[0] = command;
             }
-
-            Self::LiftOff { value } | Self::Top { value } => {
-                out[0] = value;
-            }
-
-            Self::AngleSpeed { xyz }
-            | Self::Acceleration { xyz }
-            | Self::FinAngle { xyz }
-            | Self::AccumulatedAngle { xyz } => {
-                encode_i16x3_be(xyz, out);
-            }
-
-            Self::ControllerStatus { status } => {
-                out[0] = status.raw();
-            }
-
-            Self::AirPressure { bytes } => {
-                out[0..3].copy_from_slice(&bytes);
-            }
         }
 
         self.dlc()
     }
+}
 
+impl CanRxMessage {
     pub fn decode_standard(id: u16, data: &[u8]) -> Result<Self, CanDecodeError> {
         match id {
-            CAN_ID_STOP_FIN_CONTROL => {
-                require_dlc(id, data, 1)?;
-                Ok(Self::StopFinControl { command: data[0] })
-            }
-
-            CAN_ID_EMERGENCY_STOP_PARA => {
-                require_dlc(id, data, 1)?;
-                Ok(Self::EmergencyStopPara { command: data[0] })
-            }
-
-            CAN_ID_START_SEQUENCE => {
-                require_dlc(id, data, 1)?;
-                Ok(Self::StartSequence { command: data[0] })
-            }
-
-            CAN_ID_STOP_SEQUENCE => {
-                require_dlc(id, data, 1)?;
-                Ok(Self::StopSequence { command: data[0] })
-            }
-
-            CAN_ID_OPEN_PARA => {
-                require_dlc(id, data, 1)?;
-                Ok(Self::OpenPara { command: data[0] })
-            }
-
-            CAN_ID_CLOSE_PARA => {
-                require_dlc(id, data, 1)?;
-                Ok(Self::ClosePara { command: data[0] })
-            }
-
-            CAN_ID_START_LOGGING => {
-                require_dlc(id, data, 1)?;
-                Ok(Self::StartLogging { command: data[0] })
-            }
-
-            CAN_ID_STOP_LOGGING => {
-                require_dlc(id, data, 1)?;
-                Ok(Self::StopLogging { command: data[0] })
-            }
-
             CAN_ID_LIFT_OFF => {
                 require_dlc(id, data, 1)?;
                 Ok(Self::LiftOff { value: data[0] })
@@ -328,24 +276,6 @@ impl ComboardCanMessage {
             _ => Err(CanDecodeError::UnknownId(id)),
         }
     }
-
-    pub const fn is_command(&self) -> bool {
-        matches!(
-            self,
-            Self::StopFinControl { .. }
-                | Self::EmergencyStopPara { .. }
-                | Self::StartSequence { .. }
-                | Self::StopSequence { .. }
-                | Self::OpenPara { .. }
-                | Self::ClosePara { .. }
-                | Self::StartLogging { .. }
-                | Self::StopLogging { .. }
-        )
-    }
-
-    pub const fn is_telemetry(&self) -> bool {
-        !self.is_command()
-    }
 }
 
 fn require_dlc(id: u16, data: &[u8], expected: usize) -> Result<(), CanDecodeError> {
@@ -357,16 +287,6 @@ fn require_dlc(id: u16, data: &[u8], expected: usize) -> Result<(), CanDecodeErr
             expected,
             actual: data.len(),
         })
-    }
-}
-
-fn encode_i16x3_be(values: [i16; 3], out: &mut [u8; 8]) {
-    for (index, value) in values.into_iter().enumerate() {
-        let offset = index * 2;
-        let bytes = value.to_be_bytes();
-
-        out[offset] = bytes[0];
-        out[offset + 1] = bytes[1];
     }
 }
 

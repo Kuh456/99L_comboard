@@ -1,3 +1,5 @@
+use core::sync::atomic::Ordering;
+
 use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Timer};
 use esp_hal::{
@@ -8,9 +10,12 @@ use esp_hal::{
 use esp_println::println;
 
 use crate::{
-    gnss::{gnss_setting, parse_gga},
+    gnss::{FixQuality, gnss_setting, parse_gga},
     payload::{decode_height_10m_i16, encode_height_10m_i16},
-    state::{GNSS_CHANNEL, GNSS_CMD_CHANNEL, GnssCommand, PAYLOAD_MUTEX},
+    state::{
+        GNSS_CHANNEL, GNSS_CHANNEL_DROP_COUNT, GNSS_CMD_CHANNEL, GNSS_RX_ERROR_COUNT,
+        GNSS_SETTING_ERROR_COUNT, GnssCommand, PAYLOAD_MUTEX,
+    },
 };
 
 #[embassy_executor::task]
@@ -18,6 +23,7 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
     let mut read_buf = [0u8; 90];
     let mut line_buf = [0u8; 90];
     let mut line_len = 0;
+    let mut discard_line = false;
     let mut is_on = false;
 
     loop {
@@ -30,6 +36,7 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                 for &letter in &read_buf[..bytes_read] {
                     if letter == b'$' {
                         line_len = 0;
+                        discard_line = false;
                         line_buf[line_len] = letter;
                         line_len += 1;
                         continue;
@@ -40,26 +47,34 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                     }
 
                     if letter == b'\n' {
-                        if line_len > 0 && line_buf[0] == b'$' {
+                        if !discard_line && line_len > 0 && line_buf[0] == b'$' {
                             let mut send_buf = [0u8; 90];
                             send_buf[..line_len].copy_from_slice(&line_buf[..line_len]);
 
                             if GNSS_CHANNEL.try_send(send_buf).is_err() {
-                                let _ = GNSS_CHANNEL.try_receive();
-                                let _ = GNSS_CHANNEL.try_send(send_buf);
+                                GNSS_CHANNEL_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                                if GNSS_CHANNEL.try_receive().is_err()
+                                    || GNSS_CHANNEL.try_send(send_buf).is_err()
+                                {
+                                    GNSS_CHANNEL_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
                         line_len = 0;
+                        discard_line = false;
                         continue;
                     }
 
                     if line_len < line_buf.len() {
                         line_buf[line_len] = letter;
                         line_len += 1;
+                    } else {
+                        discard_line = true;
                     }
                 }
             }
             Either::First(Err(e)) => {
+                GNSS_RX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
                 println!("UART receive error{:?}", e);
             }
             Either::Second(cmd) => match cmd {
@@ -73,16 +88,28 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                     let config_9600 = UartConfig::default().with_baudrate(9600);
                     if let Err(e) = uart.apply_config(&config_9600) {
                         println!("UART config error (9600baud rate): {:?}", e);
+                        GNSS_SETTING_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+                        gnss_en.set_low();
+                        is_on = false;
                         continue;
                     }
 
                     Timer::after(Duration::from_millis(500)).await;
-                    gnss_setting(&mut uart).await;
+                    if let Err(error) = gnss_setting(&mut uart).await {
+                        GNSS_SETTING_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+                        println!("GNSS setting failed: {:?}", error);
+                        gnss_en.set_low();
+                        is_on = false;
+                        continue;
+                    }
                     Timer::after(Duration::from_millis(50)).await;
 
                     let config_115200 = UartConfig::default().with_baudrate(115_200);
                     if let Err(e) = uart.apply_config(&config_115200) {
                         println!("UART config error (115200baud rate): {:?}", e);
+                        GNSS_SETTING_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+                        gnss_en.set_low();
+                        is_on = false;
                         continue;
                     }
                     is_on = true;
@@ -102,6 +129,7 @@ pub async fn parse_gnss_task() {
         let sentence = GNSS_CHANNEL.receive().await;
 
         if let Ok(gga_data) = parse_gga(sentence.as_slice())
+            && gga_data.fix_quality != FixQuality::Invalid
             && let (Some(lat), Some(lon), Some(height_msl)) =
                 (gga_data.latitude, gga_data.longitude, gga_data.altitude)
         {
