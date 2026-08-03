@@ -18,6 +18,7 @@ use crate::{
         protocol::CanTxMessage,
     },
     constants::{LORA_AUX_TIMEOUT_MS, LORA_TRANSMIT_INTERVAL_MS},
+    lora_uplink::UplinkFrameBuffer,
     state::{
         CAN_SAFETY_TX_SIGNAL, CAN_TX_CHANNEL, COMMAND_REQUEST_FAILURE_COUNT, COMMAND_REQUEST_STATE,
         CONTROLLER_STATUS_RAW, CanTxRequest, GNSS_CMD_CHANNEL, GnssCommand,
@@ -187,7 +188,8 @@ pub async fn command_process_task() {
 
 #[embassy_executor::task]
 pub async fn lora_task(mut uart: Uart<'static, Async>, mut aux_pin: Input<'static>) {
-    let mut rx_buf = [0u8; 64];
+    let mut rx_buf = [0u8; 3];
+    let mut uplink_frame = UplinkFrameBuffer::new();
     let mut tx_ticker = Ticker::every(Duration::from_millis(LORA_TRANSMIT_INTERVAL_MS));
 
     loop {
@@ -204,8 +206,10 @@ pub async fn lora_task(mut uart: Uart<'static, Async>, mut aux_pin: Input<'stati
             Either3::Second(Ok(len)) => {
                 if len > 0 {
                     println!("cmd: {:?}", &rx_buf[..len]);
-                    for &command in &rx_buf[..len] {
-                        if GroundCommand::decode_legacy(command).is_some() {
+                    for &byte in &rx_buf[..len] {
+                        if let Some(command) = uplink_frame.push(byte)
+                            && GroundCommand::decode_legacy(command).is_some()
+                        {
                             RECEIVED_DATA_CHANNEL.send(command).await;
                         }
                     }

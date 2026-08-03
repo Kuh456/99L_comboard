@@ -3,6 +3,7 @@
 pub mod can;
 pub mod constants;
 pub mod gnss;
+mod lora_uplink;
 pub mod payload;
 pub mod state;
 pub mod tasks;
