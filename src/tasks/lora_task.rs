@@ -1,7 +1,7 @@
 use core::sync::atomic::Ordering;
 
 use embassy_futures::select::{Either3, select3};
-use embassy_time::{Duration, Instant, Ticker, with_timeout};
+use embassy_time::{Duration, Ticker, with_timeout};
 use esp_hal::{
     Async,
     gpio::Input,
@@ -10,24 +10,34 @@ use esp_hal::{
 use esp_println::println;
 
 use crate::{
-    can::protocol::ComboardCanMessage,
+    can::{command::GroundCommand, protocol::ComboardCanMessage},
     constants::{LORA_AUX_TIMEOUT_MS, LORA_TRANSMIT_INTERVAL_MS},
     state::{
-        CAN_TX_CHANNEL, GNSS_CMD_CHANNEL, GnssCommand, IS_LOGGING, LAST_SEEN_LOG, PAYLOAD_MUTEX,
-        RECEIVED_DATA_CHANNEL, SD_FLUSH_SIGNAL, TRIGGER_SIGNAL,
+        CAN_TX_CHANNEL, COMMAND_REQUEST_FAILURE_COUNT, COMMAND_REQUEST_STATE, CanTxRequest,
+        GNSS_CMD_CHANNEL, GnssCommand, LAST_COMMAND_FAILURE, PAYLOAD_MUTEX, RECEIVED_DATA_CHANNEL,
+        TRIGGER_SIGNAL,
     },
 };
 
-const fn get_target_can_message(cmd: u8) -> Option<ComboardCanMessage> {
+const fn get_target_can_message(cmd: u8) -> Option<(ComboardCanMessage, Option<GroundCommand>)> {
     match cmd {
-        b'q' => Some(ComboardCanMessage::StopSequence { command: cmd }),
-        b's' => Some(ComboardCanMessage::StartSequence { command: cmd }),
-        b'l' => Some(ComboardCanMessage::StartLogging { command: cmd }),
-        b'm' => Some(ComboardCanMessage::StopLogging { command: cmd }),
-        b'z' => Some(ComboardCanMessage::EmergencyStopPara { command: cmd }),
-        b'E' => Some(ComboardCanMessage::StopFinControl { command: cmd }),
-        b'c' => Some(ComboardCanMessage::ClosePara { command: cmd }),
-        b'o' => Some(ComboardCanMessage::OpenPara { command: cmd }),
+        b'q' => Some((
+            ComboardCanMessage::StopSequence { command: cmd },
+            Some(GroundCommand::StopSequence),
+        )),
+        b's' => Some((
+            ComboardCanMessage::StartSequence { command: cmd },
+            Some(GroundCommand::StartSequence),
+        )),
+        b'l' => Some((ComboardCanMessage::StartLogging { command: cmd }, None)),
+        b'm' => Some((ComboardCanMessage::StopLogging { command: cmd }, None)),
+        b'z' => Some((
+            ComboardCanMessage::EmergencyStopPara { command: cmd },
+            Some(GroundCommand::EmergencyStop),
+        )),
+        b'E' => Some((ComboardCanMessage::StopFinControl { command: cmd }, None)),
+        b'c' => Some((ComboardCanMessage::ClosePara { command: cmd }, None)),
+        b'o' => Some((ComboardCanMessage::OpenPara { command: cmd }, None)),
         _ => None,
     }
 }
@@ -52,18 +62,8 @@ async fn write_all(uart: &mut Uart<'static, Async>, mut bytes: &[u8]) -> Result<
 }
 
 async fn transmit_latest_payload(uart: &mut Uart<'static, Async>, aux_pin: &mut Input<'static>) {
-    let log_is_fresh = match *LAST_SEEN_LOG.lock().await {
-        Some(last_seen) => Instant::now().duration_since(last_seen).as_secs() < 80,
-        None => false,
-    };
-
     let payload_bytes = {
         let mut payload = PAYLOAD_MUTEX.lock().await;
-        if log_is_fresh {
-            payload.status |= 0b0000_1000;
-        } else {
-            payload.status &= 0b1111_0111;
-        }
         payload.check_sum = payload.calculate_checksum();
         payload.to_bytes()
     };
@@ -95,35 +95,45 @@ async fn transmit_latest_payload(uart: &mut Uart<'static, Async>, aux_pin: &mut 
 
 #[embassy_executor::task]
 pub async fn command_process_task() {
+    let mut next_tracking_token = 0u32;
+
     loop {
         let command = RECEIVED_DATA_CHANNEL.receive().await;
 
         match command {
-            b's' => {
-                GNSS_CMD_CHANNEL.send(GnssCommand::TurnOn).await;
-                IS_LOGGING.store(true, Ordering::Relaxed);
-                let mut payload = PAYLOAD_MUTEX.lock().await;
-                payload.status = (payload.status & 0b1101_1111) | 0b0010_0000;
-            }
-            b'q' => {
-                IS_LOGGING.store(false, Ordering::Relaxed);
-                SD_FLUSH_SIGNAL.signal(());
-                GNSS_CMD_CHANNEL.send(GnssCommand::TurnOff).await;
-                let mut payload = PAYLOAD_MUTEX.lock().await;
-                payload.status &= 0b1101_1111;
-            }
-            b'l' => IS_LOGGING.store(true, Ordering::Relaxed),
-            b'm' => {
-                IS_LOGGING.store(false, Ordering::Relaxed);
-                SD_FLUSH_SIGNAL.signal(());
-            }
             b'g' => GNSS_CMD_CHANNEL.send(GnssCommand::TurnOn).await,
             b'h' => GNSS_CMD_CHANNEL.send(GnssCommand::TurnOff).await,
             _ => {}
         }
 
-        if let Some(message) = get_target_can_message(command) {
-            CAN_TX_CHANNEL.send(message).await;
+        if let Some((message, tracked_command)) = get_target_can_message(command) {
+            let request = match tracked_command {
+                Some(tracked_command) => {
+                    next_tracking_token = next_tracking_token.wrapping_add(1);
+                    let superseded = {
+                        let mut state = COMMAND_REQUEST_STATE.lock().await;
+                        let superseded = if state.is_in_flight() {
+                            *state = state.supersede();
+                            state.failure()
+                        } else {
+                            None
+                        };
+                        *state = crate::can::command::CommandRequestState::queue(
+                            next_tracking_token,
+                            tracked_command,
+                        );
+                        superseded
+                    };
+                    if let Some(superseded) = superseded {
+                        *LAST_COMMAND_FAILURE.lock().await = Some(superseded);
+                        COMMAND_REQUEST_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
+                        println!("superseding pending CAN command");
+                    }
+                    CanTxRequest::tracked(message, next_tracking_token)
+                }
+                None => CanTxRequest::untracked(message),
+            };
+            CAN_TX_CHANNEL.send(request).await;
         }
     }
 }

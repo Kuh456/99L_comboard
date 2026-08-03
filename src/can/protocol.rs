@@ -18,7 +18,101 @@ pub const CAN_ID_TOP: u16 = 0x12a;
 pub const CAN_ID_FIN_ANGLE: u16 = 0x13a;
 pub const CAN_ID_ACCUMULATED_ANGLE: u16 = 0x14a;
 
-pub const CAN_ID_INTEGRATED_BOARD_STATUS: u16 = 0x200;
+pub const CAN_ID_CONTROLLER_STATUS: u16 = 0x200;
+
+const CONTROLLER_STATUS_RESERVED_MASK: u8 = 1 << 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControllerStatusFlags {
+    raw: u8,
+}
+
+impl ControllerStatusFlags {
+    pub const fn from_raw(raw: u8) -> Option<Self> {
+        if raw & CONTROLLER_STATUS_RESERVED_MASK == 0 {
+            Some(Self { raw })
+        } else {
+            None
+        }
+    }
+
+    pub const fn raw(self) -> u8 {
+        self.raw
+    }
+
+    pub const fn top_detected(self) -> bool {
+        self.raw & (1 << 0) != 0
+    }
+
+    pub const fn main_power_on(self) -> bool {
+        self.raw & (1 << 1) != 0
+    }
+
+    pub const fn emergency_power_on(self) -> bool {
+        self.raw & (1 << 2) != 0
+    }
+
+    pub const fn control_active(self) -> bool {
+        self.raw & (1 << 3) != 0
+    }
+
+    pub const fn sequence_active(self) -> bool {
+        self.raw & (1 << 5) != 0
+    }
+
+    pub const fn liftoff_detected(self) -> bool {
+        self.raw & (1 << 6) != 0
+    }
+
+    pub const fn parachute_motor_open(self) -> bool {
+        self.raw & (1 << 7) != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControllerStatus {
+    Valid(ControllerStatusFlags),
+    Unknown(u8),
+}
+
+impl ControllerStatus {
+    pub const fn from_raw(raw: u8) -> Self {
+        match ControllerStatusFlags::from_raw(raw) {
+            Some(flags) => Self::Valid(flags),
+            None => Self::Unknown(raw),
+        }
+    }
+
+    pub const fn raw(self) -> u8 {
+        match self {
+            Self::Valid(flags) => flags.raw(),
+            Self::Unknown(raw) => raw,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControllerStatusEffects {
+    pub sequence_changed: Option<bool>,
+    pub top_rising: bool,
+}
+
+pub const fn controller_status_effects(
+    previous: Option<ControllerStatusFlags>,
+    current: ControllerStatusFlags,
+) -> ControllerStatusEffects {
+    ControllerStatusEffects {
+        sequence_changed: match previous {
+            Some(previous) if previous.sequence_active() == current.sequence_active() => None,
+            _ => Some(current.sequence_active()),
+        },
+        top_rising: current.top_detected()
+            && match previous {
+                Some(previous) => !previous.top_detected(),
+                None => true,
+            },
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComboardCanMessage {
@@ -40,7 +134,7 @@ pub enum ComboardCanMessage {
     AirPressure { bytes: [u8; 3] },
     FinAngle { xyz: [i16; 3] },
     AccumulatedAngle { xyz: [i16; 3] },
-    IntegratedBoardStatus { phase: u8, flags: u8 },
+    ControllerStatus { status: ControllerStatus },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,7 +166,7 @@ impl ComboardCanMessage {
             Self::AirPressure { .. } => CAN_ID_AIR_PRESSURE,
             Self::FinAngle { .. } => CAN_ID_FIN_ANGLE,
             Self::AccumulatedAngle { .. } => CAN_ID_ACCUMULATED_ANGLE,
-            Self::IntegratedBoardStatus { .. } => CAN_ID_INTEGRATED_BOARD_STATUS,
+            Self::ControllerStatus { .. } => CAN_ID_CONTROLLER_STATUS,
         }
     }
 
@@ -87,9 +181,8 @@ impl ComboardCanMessage {
             | Self::StartLogging { .. }
             | Self::StopLogging { .. }
             | Self::LiftOff { .. }
-            | Self::Top { .. } => 1,
-
-            Self::IntegratedBoardStatus { .. } => 2,
+            | Self::Top { .. }
+            | Self::ControllerStatus { .. } => 1,
 
             Self::AirPressure { .. } => 3,
 
@@ -126,13 +219,12 @@ impl ComboardCanMessage {
                 encode_i16x3_be(xyz, out);
             }
 
-            Self::AirPressure { bytes } => {
-                out[0..3].copy_from_slice(&bytes);
+            Self::ControllerStatus { status } => {
+                out[0] = status.raw();
             }
 
-            Self::IntegratedBoardStatus { phase, flags } => {
-                out[0] = phase;
-                out[1] = flags;
+            Self::AirPressure { bytes } => {
+                out[0..3].copy_from_slice(&bytes);
             }
         }
 
@@ -226,11 +318,10 @@ impl ComboardCanMessage {
                 })
             }
 
-            CAN_ID_INTEGRATED_BOARD_STATUS => {
-                require_dlc(id, data, 2)?;
-                Ok(Self::IntegratedBoardStatus {
-                    phase: data[0],
-                    flags: data[1],
+            CAN_ID_CONTROLLER_STATUS => {
+                require_dlc(id, data, 1)?;
+                Ok(Self::ControllerStatus {
+                    status: ControllerStatus::from_raw(data[0]),
                 })
             }
 

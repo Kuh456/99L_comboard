@@ -1,10 +1,13 @@
 #![allow(dead_code)]
 
+#[path = "../src/can/command.rs"]
+mod command;
 #[path = "../src/payload.rs"]
 mod payload;
 #[path = "../src/can/protocol.rs"]
 mod protocol;
 
+use command::{CommandFailure, CommandRequestState, GroundCommand};
 use payload::{PAYLOAD_LEN, Payload};
 use protocol::*;
 
@@ -109,13 +112,12 @@ fn message_cases() -> [(ComboardCanMessage, u16, usize, [u8; 8]); 16] {
             [1, 0, 0xff, 0, 0, 1, 0, 0],
         ),
         (
-            ComboardCanMessage::IntegratedBoardStatus {
-                phase: 0x12,
-                flags: 0xa5,
+            ComboardCanMessage::ControllerStatus {
+                status: ControllerStatus::from_raw(0xa5),
             },
-            CAN_ID_INTEGRATED_BOARD_STATUS,
-            2,
-            [0x12, 0xa5, 0, 0, 0, 0, 0, 0],
+            CAN_ID_CONTROLLER_STATUS,
+            1,
+            [0xa5, 0, 0, 0, 0, 0, 0, 0],
         ),
     ]
 }
@@ -171,6 +173,167 @@ fn unknown_standard_id_is_rejected() {
         ComboardCanMessage::decode_standard(0x7ff, &[]),
         Err(CanDecodeError::UnknownId(0x7ff)),
     );
+}
+
+#[test]
+fn controller_status_decodes_every_documented_bit() {
+    let raw = 0b1110_1111;
+    let decoded = ComboardCanMessage::decode_standard(CAN_ID_CONTROLLER_STATUS, &[raw]);
+    assert!(matches!(
+        decoded,
+        Ok(ComboardCanMessage::ControllerStatus {
+            status: ControllerStatus::Valid(_)
+        })
+    ));
+    let Ok(ComboardCanMessage::ControllerStatus {
+        status: ControllerStatus::Valid(status),
+    }) = decoded
+    else {
+        return;
+    };
+
+    assert_eq!(status.raw(), raw);
+    assert!(status.top_detected());
+    assert!(status.main_power_on());
+    assert!(status.emergency_power_on());
+    assert!(status.control_active());
+    assert!(status.sequence_active());
+    assert!(status.liftoff_detected());
+    assert!(status.parachute_motor_open());
+}
+
+#[test]
+fn reserved_controller_status_is_unknown_without_panicking() {
+    assert_eq!(
+        ComboardCanMessage::decode_standard(CAN_ID_CONTROLLER_STATUS, &[0x10]),
+        Ok(ComboardCanMessage::ControllerStatus {
+            status: ControllerStatus::Unknown(0x10),
+        }),
+    );
+}
+
+#[test]
+fn controller_status_effects_are_edge_triggered() {
+    let Some(idle) = ControllerStatusFlags::from_raw(0) else {
+        return;
+    };
+    let Some(running_at_top) = ControllerStatusFlags::from_raw((1 << 5) | 1) else {
+        return;
+    };
+
+    assert_eq!(
+        controller_status_effects(None, idle),
+        ControllerStatusEffects {
+            sequence_changed: Some(false),
+            top_rising: false,
+        }
+    );
+    assert_eq!(
+        controller_status_effects(Some(idle), running_at_top),
+        ControllerStatusEffects {
+            sequence_changed: Some(true),
+            top_rising: true,
+        }
+    );
+    assert_eq!(
+        controller_status_effects(Some(running_at_top), running_at_top),
+        ControllerStatusEffects {
+            sequence_changed: None,
+            top_rising: false,
+        }
+    );
+}
+
+#[test]
+fn requests_and_transmit_success_do_not_change_actual_status() {
+    let mut payload = Payload::new();
+    let queued = CommandRequestState::queue(1, GroundCommand::StartSequence);
+    let transmitted = queued.mark_transmitted(1, 100);
+
+    assert_eq!(payload.status, 0);
+    assert!(matches!(
+        transmitted,
+        CommandRequestState::AwaitingConfirmation { .. }
+    ));
+    assert_eq!(payload.status, 0);
+
+    let Some(controller) = ControllerStatusFlags::from_raw(1 << 5) else {
+        return;
+    };
+    payload.status = controller.raw();
+    assert_eq!(payload.status, 1 << 5);
+}
+
+#[test]
+fn pending_commands_complete_only_on_their_expected_controller_status() {
+    let start =
+        CommandRequestState::queue(1, GroundCommand::StartSequence).mark_transmitted(1, 1_000);
+    assert_eq!(start.confirm(false, true), start);
+    assert!(matches!(
+        start.confirm(true, true),
+        CommandRequestState::Completed {
+            command: GroundCommand::StartSequence,
+            ..
+        }
+    ));
+
+    let stop =
+        CommandRequestState::queue(2, GroundCommand::StopSequence).mark_transmitted(2, 1_000);
+    assert_eq!(stop.confirm(true, true), stop);
+    assert!(matches!(
+        stop.confirm(false, true),
+        CommandRequestState::Completed {
+            command: GroundCommand::StopSequence,
+            ..
+        }
+    ));
+
+    let emergency =
+        CommandRequestState::queue(3, GroundCommand::EmergencyStop).mark_transmitted(3, 1_000);
+    assert_eq!(emergency.confirm(false, true), emergency);
+    assert!(matches!(
+        emergency.confirm(false, false),
+        CommandRequestState::Completed {
+            command: GroundCommand::EmergencyStop,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn pending_timeout_and_supersede_do_not_invent_controller_state() {
+    let pending =
+        CommandRequestState::queue(7, GroundCommand::StartSequence).mark_transmitted(7, 1_000);
+    assert_eq!(pending.expire(1_499, 500), pending);
+    assert!(matches!(
+        pending.expire(1_500, 500),
+        CommandRequestState::Failed {
+            reason: CommandFailure::ConfirmationTimedOut,
+            ..
+        }
+    ));
+    assert!(matches!(
+        CommandRequestState::queue(8, GroundCommand::StopSequence).supersede(),
+        CommandRequestState::Failed {
+            reason: CommandFailure::Superseded,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn transmit_results_only_update_the_matching_request_token() {
+    let queued = CommandRequestState::queue(42, GroundCommand::StartSequence);
+    assert_eq!(queued.mark_transmitted(41, 100), queued);
+    assert_eq!(queued.mark_transmit_failed(41), queued);
+    assert!(matches!(
+        queued.mark_transmit_failed(42),
+        CommandRequestState::Failed {
+            token: 42,
+            command: GroundCommand::StartSequence,
+            reason: CommandFailure::TransmitFailed,
+        }
+    ));
 }
 
 #[test]

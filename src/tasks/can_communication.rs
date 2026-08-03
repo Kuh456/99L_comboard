@@ -11,16 +11,23 @@ use esp_println::println;
 
 use crate::{
     can::{
+        command::CommandRequestState,
         health::{CanHealth, classify_can_health},
-        protocol::ComboardCanMessage,
+        protocol::{
+            ComboardCanMessage, ControllerStatus, ControllerStatusFlags, controller_status_effects,
+        },
         tx::{CanTxError, transmit_message_with_timeout},
     },
     constants::{
         CAN_CONSECUTIVE_ERROR_THRESHOLD, CAN_HEALTH_MONITOR_INTERVAL_MS, CAN_TX_TIMEOUT_MS,
+        COMMAND_CONFIRM_TIMEOUT_MS,
     },
     state::{
         CAN_HEALTH, CAN_REC, CAN_RX_ERROR_COUNT, CAN_TEC, CAN_TX_CHANNEL, CAN_TX_ERROR_COUNT,
-        IS_CAN_ERROR, LAST_SEEN_LOG, PAYLOAD_MUTEX, TRIGGER_SIGNAL,
+        COMMAND_REQUEST_FAILURE_COUNT, COMMAND_REQUEST_STATE, CONTROLLER_STATUS_RAW,
+        CONTROLLER_STATUS_RX_COUNT, GNSS_CMD_CHANNEL, GnssCommand, HAS_VALID_CONTROLLER_STATUS,
+        IS_CAN_ERROR, IS_LOGGING, LAST_COMMAND_FAILURE, LAST_SEEN_CONTROLLER, PAYLOAD_MUTEX,
+        SD_FLUSH_SIGNAL, TRIGGER_SIGNAL,
     },
 };
 
@@ -122,17 +129,7 @@ fn publish_error_state(
 
 async fn apply_received_message(message: ComboardCanMessage) {
     match message {
-        ComboardCanMessage::LiftOff { .. } => {
-            let mut payload = PAYLOAD_MUTEX.lock().await;
-            payload.status = (payload.status & 0b1011_1111) | 0b0100_0000;
-        }
-        ComboardCanMessage::Top { .. } => {
-            {
-                let mut payload = PAYLOAD_MUTEX.lock().await;
-                payload.status = (payload.status & 0b0111_1111) | 0b1000_0000;
-            }
-            TRIGGER_SIGNAL.signal(true);
-        }
+        ComboardCanMessage::LiftOff { .. } | ComboardCanMessage::Top { .. } => {}
         ComboardCanMessage::AngleSpeed { xyz } => {
             PAYLOAD_MUTEX.lock().await.angle_speed = xyz;
         }
@@ -148,11 +145,8 @@ async fn apply_received_message(message: ComboardCanMessage) {
         // The protocol contains three i16 fin values, while Payload has one i8
         // field. Do not guess which value or narrowing rule should be used.
         ComboardCanMessage::FinAngle { .. } => {}
-        // 0x200 is the log-board heartbeat; phase/flags have no Payload mapping.
-        ComboardCanMessage::IntegratedBoardStatus { .. } => {
-            *LAST_SEEN_LOG.lock().await = Some(Instant::now());
-            let mut payload = PAYLOAD_MUTEX.lock().await;
-            payload.status |= 0b0000_1000;
+        ComboardCanMessage::ControllerStatus { status } => {
+            apply_controller_status(status).await;
         }
         // Command frames are transmitted by this board and have no RX side effect.
         ComboardCanMessage::StopFinControl { .. }
@@ -163,6 +157,103 @@ async fn apply_received_message(message: ComboardCanMessage) {
         | ComboardCanMessage::ClosePara { .. }
         | ComboardCanMessage::StartLogging { .. }
         | ComboardCanMessage::StopLogging { .. } => {}
+    }
+}
+
+fn previous_controller_status() -> Option<ControllerStatusFlags> {
+    if !HAS_VALID_CONTROLLER_STATUS.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    match ControllerStatus::from_raw(CONTROLLER_STATUS_RAW.load(Ordering::Relaxed)) {
+        ControllerStatus::Valid(status) => Some(status),
+        ControllerStatus::Unknown(_) => None,
+    }
+}
+
+async fn apply_controller_status(status: ControllerStatus) {
+    *LAST_SEEN_CONTROLLER.lock().await = Some(Instant::now());
+    CONTROLLER_STATUS_RX_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    let ControllerStatus::Valid(status) = status else {
+        HAS_VALID_CONTROLLER_STATUS.store(false, Ordering::Relaxed);
+        println!("unknown controller status: 0x{:02x}", status.raw());
+        return;
+    };
+
+    let effects = controller_status_effects(previous_controller_status(), status);
+    CONTROLLER_STATUS_RAW.store(status.raw(), Ordering::Relaxed);
+    HAS_VALID_CONTROLLER_STATUS.store(true, Ordering::Relaxed);
+    PAYLOAD_MUTEX.lock().await.status = status.raw();
+
+    if let Some(sequence_active) = effects.sequence_changed {
+        IS_LOGGING.store(sequence_active, Ordering::Relaxed);
+        let gnss_command = if sequence_active {
+            GnssCommand::TurnOn
+        } else {
+            SD_FLUSH_SIGNAL.signal(());
+            GnssCommand::TurnOff
+        };
+        publish_latest_gnss_command(gnss_command);
+    }
+
+    let mut request_state = COMMAND_REQUEST_STATE.lock().await;
+    let previous_request = *request_state;
+    *request_state = request_state.confirm(status.sequence_active(), status.liftoff_detected());
+    if previous_request != *request_state
+        && let CommandRequestState::Completed { command, .. } = *request_state
+    {
+        println!("CAN command confirmed by controller: {:?}", command);
+    }
+    drop(request_state);
+
+    if effects.top_rising {
+        TRIGGER_SIGNAL.signal(true);
+    }
+}
+
+fn publish_latest_gnss_command(command: GnssCommand) {
+    if GNSS_CMD_CHANNEL.try_send(command).is_ok() {
+        return;
+    }
+
+    if GNSS_CMD_CHANNEL.try_receive().is_err() || GNSS_CMD_CHANNEL.try_send(command).is_err() {
+        println!("failed to publish GNSS state from controller status");
+    }
+}
+
+async fn mark_request_transmitted(token: u32) {
+    let mut state = COMMAND_REQUEST_STATE.lock().await;
+    *state = state.mark_transmitted(token, Instant::now().as_millis());
+}
+
+async fn mark_request_transmit_failed(token: u32) {
+    let failure = {
+        let mut state = COMMAND_REQUEST_STATE.lock().await;
+        let previous = *state;
+        *state = state.mark_transmit_failed(token);
+        (previous != *state).then(|| state.failure()).flatten()
+    };
+    if let Some(failure) = failure {
+        COMMAND_REQUEST_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
+        *LAST_COMMAND_FAILURE.lock().await = Some(failure);
+    }
+}
+
+async fn expire_pending_request() {
+    let failure = {
+        let mut state = COMMAND_REQUEST_STATE.lock().await;
+        let previous = *state;
+        *state = state.expire(Instant::now().as_millis(), COMMAND_CONFIRM_TIMEOUT_MS);
+        (previous != *state).then(|| state.failure()).flatten()
+    };
+    if let Some(failure) = failure {
+        COMMAND_REQUEST_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
+        *LAST_COMMAND_FAILURE.lock().await = Some(failure);
+        println!(
+            "CAN command confirmation failed: {:?} {:?}",
+            failure.command, failure.reason
+        );
     }
 }
 
@@ -201,16 +292,22 @@ pub async fn can_communication_task(mut can: twai::Twai<'static, Async>) {
         )
         .await
         {
-            Either3::Second(message) => {
-                match transmit_message_with_timeout(&mut can, message, tx_timeout).await {
+            Either3::Second(request) => {
+                match transmit_message_with_timeout(&mut can, request.message, tx_timeout).await {
                     Ok(()) => {
                         consecutive_tx_errors = 0;
+                        if let Some(token) = request.tracking_token {
+                            mark_request_transmitted(token).await;
+                        }
                         runtime_state =
                             transition_runtime(runtime_state, CanRuntimeEvent::TransmitSucceeded).0;
                     }
                     Err(error) => {
                         CAN_TX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
                         consecutive_tx_errors = consecutive_tx_errors.saturating_add(1);
+                        if let Some(token) = request.tracking_token {
+                            mark_request_transmit_failed(token).await;
+                        }
                         println!("CAN transmit error: {:?}", error);
 
                         if matches!(error, CanTxError::BusOff | CanTxError::TimedOutUnknownState) {
@@ -274,6 +371,7 @@ pub async fn can_communication_task(mut can: twai::Twai<'static, Async>) {
                 }
             },
             Either3::First(_) => {
+                expire_pending_request().await;
                 let health = publish_health(&can);
                 if health == CanHealth::BusOff {
                     let recovery = enter_recovering(can, runtime_state, CanRuntimeEvent::BusOff);
