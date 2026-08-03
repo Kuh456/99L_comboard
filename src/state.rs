@@ -7,7 +7,7 @@ use embassy_time::Instant;
 
 use crate::{
     can::{
-        command::{CommandFailureRecord, CommandRequestState},
+        command::{CommandFailureRecord, CommandRequestState, GroundCommand},
         protocol::{CanTxMessage, ControllerLinkState, ControllerStatus},
     },
     payload::Payload,
@@ -48,20 +48,26 @@ pub enum GnssCommand {
 pub struct CanTxRequest {
     pub message: CanTxMessage,
     pub tracking_token: Option<u32>,
+    pub command: GroundCommand,
+    pub generation: u32,
 }
 
 impl CanTxRequest {
-    pub const fn untracked(message: CanTxMessage) -> Self {
+    pub const fn untracked(message: CanTxMessage, command: GroundCommand, generation: u32) -> Self {
         Self {
             message,
             tracking_token: None,
+            command,
+            generation,
         }
     }
 
-    pub const fn tracked(message: CanTxMessage, token: u32) -> Self {
+    pub const fn tracked(message: CanTxMessage, command: GroundCommand, token: u32) -> Self {
         Self {
             message,
             tracking_token: Some(token),
+            command,
+            generation: token,
         }
     }
 }
@@ -90,6 +96,10 @@ pub static SD_DROPPED_ROW_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static HAS_UNFLUSHED_DATA: AtomicBool = AtomicBool::new(false);
 pub static SD_FLUSH_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 pub static CAN_TX_CHANNEL: Channel<CriticalSectionRawMutex, CanTxRequest, 8> = Channel::new();
+pub static CAN_SAFETY_TX_SIGNAL: Signal<CriticalSectionRawMutex, CanTxRequest> = Signal::new();
+pub static LATEST_SEQUENCE_GENERATION: AtomicU32 = AtomicU32::new(0);
+pub static LATEST_LOGGING_GENERATION: AtomicU32 = AtomicU32::new(0);
+pub static LATEST_PARA_POSITION_GENERATION: AtomicU32 = AtomicU32::new(0);
 pub static IS_CAN_ERROR: AtomicBool = AtomicBool::new(true);
 pub static CAN_TEC: AtomicU8 = AtomicU8::new(0);
 pub static CAN_REC: AtomicU8 = AtomicU8::new(0);

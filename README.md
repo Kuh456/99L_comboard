@@ -21,14 +21,14 @@ flagsに分割する根拠は確認できておらず、現在確認できる仕
 | 1 | main power | ON |
 | 2 | emergency power | ON |
 | 3 | control active | active |
-| 4 | reserved | 設定時は全byteを`Unknown(raw)`扱い |
+| 4 | reserved | 未知bitとしてrawに保持 |
 | 5 | sequence active | active |
 | 6 | liftoff | 検出済み |
 | 7 | parachute motor | open |
 
 byte内はLSBをbit 0とします。複数byte値はありません。独立したphase値、fault flags、
-送信周期、起動時の送信値、状態ラッチ仕様は未確定です。未知値はrawを保持し、
-Payloadや実状態へ適用しません。
+送信周期、起動時の送信値、状態ラッチ仕様は未確定です。未知bitはrawに保持しつつ、
+既知bitは常に解釈します。
 
 `ControllerLinkState`は起動時`Unknown`、有効な受信後`Online`です。周期が未確定のため
 実機のstale timeoutは現在無効です。純粋判定関数は設定可能ですが、推測した時間を
@@ -48,11 +48,18 @@ CAN controllerのTEC/REC/Bus Off healthとは別の状態です。
 | `o` / `c` | parachute open / close |
 | `g` / `h` | GNSS manual on / off |
 
-未知byteは無視します。`s`、`q`、`z`はqueued → transmitted → confirmed/failedへ進み、
-confirmedはそれぞれ0x200のsequence bit ON、OFF、liftoff bit OFFでのみ成立します。
-確認timeoutは500 ms（既存の確認済み要求値）で、自動再送は冪等性未確認のため行いません。
-新しい追跡対象要求は古いpendingをsupersededにします。CAN復旧時もキューを一括破棄せず、
-緊急停止を含め受信した要求を送信処理へ渡します。
+未知byteは無視します。`s`、`q`はqueued → transmitted → confirmed/failedへ進み、
+confirmedはそれぞれ0x200のsequence bit ON、OFFで成立します。要求時点ですでに目標bitなら
+CAN送信せず`AlreadySatisfied`とします。`z`は送信済みまで管理しますが、0x200に明示ACKや
+緊急停止状態bitがないためCompletedにはしません。特にliftoff=0は起動直後にも成立するため
+完了根拠に使用しません。
+
+確認timeoutは暫定500 msで、これは実行失敗ではなく`ConfirmationTimedOut`、すなわち
+確認不能を意味します。実状態は最後の0x200のままです。0x200周期を実機測定後に再設定が
+必要です。自動再送は冪等性未確認のため行いません。
+同じカテゴリの新しい要求は古いqueued要求をsupersededにします。対象はsequence start/stop、
+logging start/stop、parachute open/closeです。復旧後は各カテゴリの最新だけを送り、緊急停止は
+専用Signalから通常FIFOより優先します。ただし一度失敗した緊急停止の自動再送はしません。
 
 ## Payload
 
@@ -63,13 +70,16 @@ i16、15..20 gyro、21..26 acceleration、27..32 integrated angle、33..35 press
 形式、順序、checksumは変更していません。
 
 0x110/0x12aの旧LiftOff/TOPは値の送信側仕様が未確認で、状態の唯一性を守るためPayloadへ
-反映せず受信数だけ記録します。TOP即時送信は0x200 bit 0の立上りで行います。
+反映せず受信数だけ記録します。TOP即時送信は0x200 bit 0の立上りで行い、初回受信時に
+すでにTOP=1でも送信します。同じTOP=1の周期フレームでは再トリガーしません。
 FinAngleはCAN `[i16;3]` とPayload `i8`の対応が未定義なので変換せず破棄数を記録します。
 Payloadの0は実測0と未更新を区別できません。
 
 ## GNSS・SD・故障時挙動
 
-シーケンスbitの0x200通知でSDの`logging_requested`とGNSS要求を切り替えます。SDは
+StartSequence要求の受理時にSDの`logging_requested`を立て、GNSSをON要求しますが、
+Payloadのsequence bitは変更しません。StopSequence確認だけでは停止せず、独立した
+StartLogging/StopLoggingコマンドをログ開始・停止の基準にします。SDは
 `logging_active`を分離し、open/write/flush失敗時はactiveを解除してエラー・drop数を
 記録します。CSV列は変更していません。GNSSは設定が全て成功してからON扱いにし、Invalid
 fixを採用せず、overflowしたNMEA行全体を次の改行まで破棄します。

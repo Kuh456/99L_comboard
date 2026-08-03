@@ -1,6 +1,6 @@
 use core::sync::atomic::Ordering;
 
-use embassy_futures::select::{Either3, select3};
+use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_time::{Duration, Instant, Ticker};
 use embedded_can::{Frame, Id};
 use esp_hal::{
@@ -11,11 +11,12 @@ use esp_println::println;
 
 use crate::{
     can::{
-        command::CommandRequestState,
+        command::{
+            CommandFailure, CommandFailureRecord, CommandRequestState, queued_request_is_current,
+        },
         health::{CanHealth, classify_can_health},
         protocol::{
-            CanRxMessage, ControllerLinkState, ControllerStatus, ControllerStatusFlags,
-            controller_status_effects,
+            CanRxMessage, ControllerLinkState, ControllerStatus, controller_status_effects,
         },
         tx::{CanTxError, transmit_message_with_timeout},
     },
@@ -24,12 +25,12 @@ use crate::{
         COMMAND_CONFIRM_TIMEOUT_MS,
     },
     state::{
-        CAN_HEALTH, CAN_REC, CAN_RX_ERROR_COUNT, CAN_TEC, CAN_TX_CHANNEL, CAN_TX_ERROR_COUNT,
-        COMMAND_REQUEST_FAILURE_COUNT, COMMAND_REQUEST_STATE, CONTROLLER_STATUS_RAW,
-        CONTROLLER_STATUS_RX_COUNT, CONTROLLER_STATUS_STATE, FIN_ANGLE_DROPPED_COUNT,
-        GNSS_CMD_CHANNEL, GnssCommand, HAS_VALID_CONTROLLER_STATUS, IS_CAN_ERROR,
-        LAST_COMMAND_FAILURE, LEGACY_LIFTOFF_TOP_RX_COUNT, LOGGING_REQUESTED, PAYLOAD_MUTEX,
-        SD_FLUSH_SIGNAL, TRIGGER_SIGNAL,
+        CAN_HEALTH, CAN_REC, CAN_RX_ERROR_COUNT, CAN_SAFETY_TX_SIGNAL, CAN_TEC, CAN_TX_CHANNEL,
+        CAN_TX_ERROR_COUNT, COMMAND_REQUEST_FAILURE_COUNT, COMMAND_REQUEST_STATE,
+        CONTROLLER_STATUS_RAW, CONTROLLER_STATUS_RX_COUNT, CONTROLLER_STATUS_STATE,
+        FIN_ANGLE_DROPPED_COUNT, HAS_VALID_CONTROLLER_STATUS, IS_CAN_ERROR, LAST_COMMAND_FAILURE,
+        LATEST_LOGGING_GENERATION, LATEST_PARA_POSITION_GENERATION, LATEST_SEQUENCE_GENERATION,
+        LEGACY_LIFTOFF_TOP_RX_COUNT, PAYLOAD_MUTEX, TRIGGER_SIGNAL,
     },
 };
 
@@ -157,15 +158,14 @@ async fn apply_received_message(message: CanRxMessage) {
     }
 }
 
-fn previous_controller_status() -> Option<ControllerStatusFlags> {
+fn previous_controller_status() -> Option<ControllerStatus> {
     if !HAS_VALID_CONTROLLER_STATUS.load(Ordering::Relaxed) {
         return None;
     }
 
-    match ControllerStatus::from_raw(CONTROLLER_STATUS_RAW.load(Ordering::Relaxed)) {
-        ControllerStatus::Valid(status) => Some(status),
-        ControllerStatus::Unknown(_) => None,
-    }
+    Some(ControllerStatus::from_raw(
+        CONTROLLER_STATUS_RAW.load(Ordering::Relaxed),
+    ))
 }
 
 async fn apply_controller_status(status: ControllerStatus) {
@@ -177,27 +177,10 @@ async fn apply_controller_status(status: ControllerStatus) {
     }
     CONTROLLER_STATUS_RX_COUNT.fetch_add(1, Ordering::Relaxed);
 
-    let ControllerStatus::Valid(status) = status else {
-        HAS_VALID_CONTROLLER_STATUS.store(false, Ordering::Relaxed);
-        println!("unknown controller status: 0x{:02x}", status.raw());
-        return;
-    };
-
     let effects = controller_status_effects(previous_controller_status(), status);
     CONTROLLER_STATUS_RAW.store(status.raw(), Ordering::Relaxed);
     HAS_VALID_CONTROLLER_STATUS.store(true, Ordering::Relaxed);
     PAYLOAD_MUTEX.lock().await.status = status.raw();
-
-    if let Some(sequence_active) = effects.sequence_changed {
-        LOGGING_REQUESTED.store(sequence_active, Ordering::Relaxed);
-        let gnss_command = if sequence_active {
-            GnssCommand::TurnOn
-        } else {
-            SD_FLUSH_SIGNAL.signal(());
-            GnssCommand::TurnOff
-        };
-        publish_latest_gnss_command(gnss_command);
-    }
 
     let mut request_state = COMMAND_REQUEST_STATE.lock().await;
     let previous_request = *request_state;
@@ -211,16 +194,6 @@ async fn apply_controller_status(status: ControllerStatus) {
 
     if effects.top_rising {
         TRIGGER_SIGNAL.signal(true);
-    }
-}
-
-fn publish_latest_gnss_command(command: GnssCommand) {
-    if GNSS_CMD_CHANNEL.try_send(command).is_ok() {
-        return;
-    }
-
-    if GNSS_CMD_CHANNEL.try_receive().is_err() || GNSS_CMD_CHANNEL.try_send(command).is_err() {
-        println!("failed to publish GNSS state from controller status");
     }
 }
 
@@ -253,7 +226,7 @@ async fn expire_pending_request() {
         COMMAND_REQUEST_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
         *LAST_COMMAND_FAILURE.lock().await = Some(failure);
         println!(
-            "CAN command confirmation failed: {:?} {:?}",
+            "CAN command confirmation unavailable: {:?} {:?}",
             failure.command, failure.reason
         );
     }
@@ -278,6 +251,16 @@ async fn handle_received_frame(frame: EspTwaiFrame) {
     }
 }
 
+fn request_is_current(request: &crate::state::CanTxRequest) -> bool {
+    queued_request_is_current(
+        request.command,
+        request.generation,
+        LATEST_SEQUENCE_GENERATION.load(Ordering::Relaxed),
+        LATEST_LOGGING_GENERATION.load(Ordering::Relaxed),
+        LATEST_PARA_POSITION_GENERATION.load(Ordering::Relaxed),
+    )
+}
+
 #[embassy_executor::task]
 pub async fn can_communication_task(mut can: twai::Twai<'static, Async>) {
     let mut runtime_state = CanRuntimeState::AwaitingTraffic;
@@ -289,12 +272,25 @@ pub async fn can_communication_task(mut can: twai::Twai<'static, Async>) {
     loop {
         match select3(
             health_ticker.next(),
-            CAN_TX_CHANNEL.receive(),
+            select(CAN_SAFETY_TX_SIGNAL.wait(), CAN_TX_CHANNEL.receive()),
             can.receive_async(),
         )
         .await
         {
             Either3::Second(request) => {
+                let request = match request {
+                    Either::First(request) | Either::Second(request) => request,
+                };
+                if !request_is_current(&request) {
+                    *LAST_COMMAND_FAILURE.lock().await = Some(CommandFailureRecord {
+                        token: request.generation,
+                        command: request.command,
+                        reason: CommandFailure::Superseded,
+                    });
+                    COMMAND_REQUEST_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
+                    println!("superseded queued CAN command: {:?}", request.command);
+                    continue;
+                }
                 match transmit_message_with_timeout(&mut can, request.message, tx_timeout).await {
                     Ok(()) => {
                         consecutive_tx_errors = 0;

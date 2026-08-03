@@ -10,13 +10,21 @@ use esp_hal::{
 use esp_println::println;
 
 use crate::{
-    can::{command::GroundCommand, protocol::CanTxMessage},
+    can::{
+        command::{
+            CommandCategory, CommandPriority, CommandRequestState, GroundCommand,
+            command_already_satisfied, may_supersede,
+        },
+        protocol::CanTxMessage,
+    },
     constants::{LORA_AUX_TIMEOUT_MS, LORA_TRANSMIT_INTERVAL_MS},
     state::{
-        CAN_TX_CHANNEL, COMMAND_REQUEST_FAILURE_COUNT, COMMAND_REQUEST_STATE, CanTxRequest,
-        GNSS_CMD_CHANNEL, GnssCommand, LAST_COMMAND_FAILURE, LORA_AUX_TIMEOUT_COUNT,
-        LORA_RX_ERROR_COUNT, LORA_TX_ERROR_COUNT, PAYLOAD_MUTEX, RECEIVED_DATA_CHANNEL,
-        TRIGGER_SIGNAL,
+        CAN_SAFETY_TX_SIGNAL, CAN_TX_CHANNEL, COMMAND_REQUEST_FAILURE_COUNT, COMMAND_REQUEST_STATE,
+        CONTROLLER_STATUS_RAW, CanTxRequest, GNSS_CMD_CHANNEL, GnssCommand,
+        HAS_VALID_CONTROLLER_STATUS, LAST_COMMAND_FAILURE, LATEST_LOGGING_GENERATION,
+        LATEST_PARA_POSITION_GENERATION, LATEST_SEQUENCE_GENERATION, LOGGING_REQUESTED,
+        LORA_AUX_TIMEOUT_COUNT, LORA_RX_ERROR_COUNT, LORA_TX_ERROR_COUNT, PAYLOAD_MUTEX,
+        RECEIVED_DATA_CHANNEL, SD_FLUSH_SIGNAL, TRIGGER_SIGNAL,
     },
 };
 
@@ -86,13 +94,24 @@ async fn transmit_latest_payload(uart: &mut Uart<'static, Async>, aux_pin: &mut 
 
 #[embassy_executor::task]
 pub async fn command_process_task() {
-    let mut next_tracking_token = 0u32;
+    let mut next_generation = 0u32;
 
     loop {
         let Some(command) = GroundCommand::decode_legacy(RECEIVED_DATA_CHANNEL.receive().await)
         else {
             continue;
         };
+
+        let effects = command.acceptance_effects();
+        if let Some(logging_requested) = effects.logging_requested {
+            LOGGING_REQUESTED.store(logging_requested, Ordering::Relaxed);
+            if !logging_requested {
+                SD_FLUSH_SIGNAL.signal(());
+            }
+        }
+        if effects.gnss_turn_on {
+            GNSS_CMD_CHANNEL.send(GnssCommand::TurnOn).await;
+        }
 
         match command {
             GroundCommand::GnssOn => GNSS_CMD_CHANNEL.send(GnssCommand::TurnOn).await,
@@ -101,20 +120,51 @@ pub async fn command_process_task() {
         }
 
         if let Some(message) = get_target_can_message(command) {
+            next_generation = next_generation.wrapping_add(1);
+            let generation = next_generation;
+            match command.category() {
+                CommandCategory::Sequence => {
+                    LATEST_SEQUENCE_GENERATION.store(generation, Ordering::Relaxed)
+                }
+                CommandCategory::Logging => {
+                    LATEST_LOGGING_GENERATION.store(generation, Ordering::Relaxed)
+                }
+                CommandCategory::ParachutePosition => {
+                    LATEST_PARA_POSITION_GENERATION.store(generation, Ordering::Relaxed)
+                }
+                CommandCategory::Other => {}
+            }
+
             let request = if command.is_confirmed_by_controller_status() {
-                next_tracking_token = next_tracking_token.wrapping_add(1);
+                if HAS_VALID_CONTROLLER_STATUS.load(Ordering::Relaxed)
+                    && command_already_satisfied(
+                        command,
+                        crate::can::protocol::ControllerStatus::from_raw(
+                            CONTROLLER_STATUS_RAW.load(Ordering::Relaxed),
+                        )
+                        .sequence_active(),
+                    )
+                {
+                    *COMMAND_REQUEST_STATE.lock().await =
+                        CommandRequestState::already_satisfied(generation, command);
+                    println!("CAN command already satisfied: {:?}", command);
+                    continue;
+                }
                 let superseded = {
                     let mut state = COMMAND_REQUEST_STATE.lock().await;
+                    if let Some(existing) = state.in_flight_command()
+                        && !may_supersede(existing, command)
+                    {
+                        println!("normal command rejected while safety request is pending");
+                        continue;
+                    }
                     let superseded = if state.is_in_flight() {
                         *state = state.supersede();
                         state.failure()
                     } else {
                         None
                     };
-                    *state = crate::can::command::CommandRequestState::queue(
-                        next_tracking_token,
-                        command,
-                    );
+                    *state = crate::can::command::CommandRequestState::queue(generation, command);
                     superseded
                 };
                 if let Some(superseded) = superseded {
@@ -122,11 +172,15 @@ pub async fn command_process_task() {
                     COMMAND_REQUEST_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
                     println!("superseding pending CAN command");
                 }
-                CanTxRequest::tracked(message, next_tracking_token)
+                CanTxRequest::tracked(message, command, generation)
             } else {
-                CanTxRequest::untracked(message)
+                CanTxRequest::untracked(message, command, generation)
             };
-            CAN_TX_CHANNEL.send(request).await;
+            if command.priority() == CommandPriority::SafetyCritical {
+                CAN_SAFETY_TX_SIGNAL.signal(request);
+            } else {
+                CAN_TX_CHANNEL.send(request).await;
+            }
         }
     }
 }

@@ -43,20 +43,16 @@ pub const fn controller_link_state(
     }
 }
 
-const CONTROLLER_STATUS_RESERVED_MASK: u8 = 1 << 4;
+const CONTROLLER_STATUS_KNOWN_MASK: u8 = 0b11101111;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ControllerStatusFlags {
+pub struct ControllerStatus {
     raw: u8,
 }
 
-impl ControllerStatusFlags {
-    pub const fn from_raw(raw: u8) -> Option<Self> {
-        if raw & CONTROLLER_STATUS_RESERVED_MASK == 0 {
-            Some(Self { raw })
-        } else {
-            None
-        }
+impl ControllerStatus {
+    pub const fn from_raw(raw: u8) -> Self {
+        Self { raw }
     }
 
     pub const fn raw(self) -> u8 {
@@ -90,27 +86,9 @@ impl ControllerStatusFlags {
     pub const fn parachute_motor_open(self) -> bool {
         self.raw & (1 << 7) != 0
     }
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ControllerStatus {
-    Valid(ControllerStatusFlags),
-    Unknown(u8),
-}
-
-impl ControllerStatus {
-    pub const fn from_raw(raw: u8) -> Self {
-        match ControllerStatusFlags::from_raw(raw) {
-            Some(flags) => Self::Valid(flags),
-            None => Self::Unknown(raw),
-        }
-    }
-
-    pub const fn raw(self) -> u8 {
-        match self {
-            Self::Valid(flags) => flags.raw(),
-            Self::Unknown(raw) => raw,
-        }
+    pub const fn unknown_bits(self) -> u8 {
+        self.raw & !CONTROLLER_STATUS_KNOWN_MASK
     }
 }
 
@@ -121,8 +99,8 @@ pub struct ControllerStatusEffects {
 }
 
 pub const fn controller_status_effects(
-    previous: Option<ControllerStatusFlags>,
-    current: ControllerStatusFlags,
+    previous: Option<ControllerStatus>,
+    current: ControllerStatus,
 ) -> ControllerStatusEffects {
     ControllerStatusEffects {
         sequence_changed: match previous {

@@ -62,12 +62,16 @@ pub enum CommandRequestState {
         token: u32,
         command: GroundCommand,
     },
-    AwaitingConfirmation {
+    Transmitted {
         token: u32,
         command: GroundCommand,
         transmitted_at_ms: u64,
     },
     Completed {
+        token: u32,
+        command: GroundCommand,
+    },
+    AlreadySatisfied {
         token: u32,
         command: GroundCommand,
     },
@@ -83,11 +87,19 @@ impl CommandRequestState {
         Self::Queued { token, command }
     }
 
+    pub const fn already_satisfied(token: u32, command: GroundCommand) -> Self {
+        Self::AlreadySatisfied { token, command }
+    }
+
     pub const fn is_in_flight(self) -> bool {
-        matches!(
-            self,
-            Self::Queued { .. } | Self::AwaitingConfirmation { .. }
-        )
+        matches!(self, Self::Queued { .. } | Self::Transmitted { .. })
+    }
+
+    pub const fn in_flight_command(self) -> Option<GroundCommand> {
+        match self {
+            Self::Queued { command, .. } | Self::Transmitted { command, .. } => Some(command),
+            _ => None,
+        }
     }
 
     pub const fn mark_transmitted(self, token: u32, now_ms: u64) -> Self {
@@ -95,7 +107,7 @@ impl CommandRequestState {
             Self::Queued {
                 token: current_token,
                 command,
-            } if current_token == token => Self::AwaitingConfirmation {
+            } if current_token == token => Self::Transmitted {
                 token,
                 command,
                 transmitted_at_ms: now_ms,
@@ -120,7 +132,7 @@ impl CommandRequestState {
 
     pub const fn confirm(self, sequence_active: bool, liftoff_detected: bool) -> Self {
         match self {
-            Self::AwaitingConfirmation { token, command, .. }
+            Self::Transmitted { token, command, .. }
                 if command_completed(command, sequence_active, liftoff_detected) =>
             {
                 Self::Completed { token, command }
@@ -131,7 +143,7 @@ impl CommandRequestState {
 
     pub const fn expire(self, now_ms: u64, timeout_ms: u64) -> Self {
         match self {
-            Self::AwaitingConfirmation {
+            Self::Transmitted {
                 token,
                 command,
                 transmitted_at_ms,
@@ -146,7 +158,7 @@ impl CommandRequestState {
 
     pub const fn supersede(self) -> Self {
         match self {
-            Self::Queued { token, command } | Self::AwaitingConfirmation { token, command, .. } => {
+            Self::Queued { token, command } | Self::Transmitted { token, command, .. } => {
                 Self::Failed {
                     token,
                     command,
@@ -176,12 +188,14 @@ impl CommandRequestState {
 pub const fn command_completed(
     command: GroundCommand,
     sequence_active: bool,
-    liftoff_detected: bool,
+    _liftoff_detected: bool,
 ) -> bool {
     match command {
         GroundCommand::StartSequence => sequence_active,
         GroundCommand::StopSequence => !sequence_active,
-        GroundCommand::EmergencyStopPara => !liftoff_detected,
+        // 0x200 has no acknowledged emergency-stop state. Liftoff=0 is also
+        // true before launch, so it cannot prove command execution.
+        GroundCommand::EmergencyStopPara => false,
         GroundCommand::StartLogging
         | GroundCommand::StopLogging
         | GroundCommand::StopFinControl
@@ -190,4 +204,94 @@ pub const fn command_completed(
         | GroundCommand::GnssOn
         | GroundCommand::GnssOff => false,
     }
+}
+
+pub const fn command_already_satisfied(command: GroundCommand, sequence_active: bool) -> bool {
+    match command {
+        GroundCommand::StartSequence => sequence_active,
+        GroundCommand::StopSequence => !sequence_active,
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandCategory {
+    Sequence,
+    Logging,
+    ParachutePosition,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CommandPriority {
+    Normal,
+    SafetyCritical,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandAcceptanceEffects {
+    pub logging_requested: Option<bool>,
+    pub gnss_turn_on: bool,
+}
+
+impl GroundCommand {
+    pub const fn category(self) -> CommandCategory {
+        match self {
+            Self::StartSequence | Self::StopSequence => CommandCategory::Sequence,
+            Self::StartLogging | Self::StopLogging => CommandCategory::Logging,
+            Self::OpenPara | Self::ClosePara => CommandCategory::ParachutePosition,
+            _ => CommandCategory::Other,
+        }
+    }
+
+    pub const fn priority(self) -> CommandPriority {
+        if self.is_safety_critical() {
+            CommandPriority::SafetyCritical
+        } else {
+            CommandPriority::Normal
+        }
+    }
+
+    pub const fn acceptance_effects(self) -> CommandAcceptanceEffects {
+        match self {
+            Self::StartSequence => CommandAcceptanceEffects {
+                logging_requested: Some(true),
+                gnss_turn_on: true,
+            },
+            Self::StartLogging => CommandAcceptanceEffects {
+                logging_requested: Some(true),
+                gnss_turn_on: false,
+            },
+            Self::StopLogging => CommandAcceptanceEffects {
+                logging_requested: Some(false),
+                gnss_turn_on: false,
+            },
+            _ => CommandAcceptanceEffects {
+                logging_requested: None,
+                gnss_turn_on: false,
+            },
+        }
+    }
+}
+
+pub const fn queued_request_is_current(
+    command: GroundCommand,
+    generation: u32,
+    latest_sequence: u32,
+    latest_logging: u32,
+    latest_parachute_position: u32,
+) -> bool {
+    match command.category() {
+        CommandCategory::Sequence => generation == latest_sequence,
+        CommandCategory::Logging => generation == latest_logging,
+        CommandCategory::ParachutePosition => generation == latest_parachute_position,
+        CommandCategory::Other => true,
+    }
+}
+
+pub const fn may_supersede(existing: GroundCommand, incoming: GroundCommand) -> bool {
+    !matches!(
+        (existing.priority(), incoming.priority()),
+        (CommandPriority::SafetyCritical, CommandPriority::Normal)
+    )
 }

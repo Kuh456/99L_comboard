@@ -7,7 +7,10 @@ mod payload;
 #[path = "../src/can/protocol.rs"]
 mod protocol;
 
-use command::{CommandFailure, CommandRequestState, GroundCommand};
+use command::{
+    CommandFailure, CommandPriority, CommandRequestState, GroundCommand, command_already_satisfied,
+    may_supersede, queued_request_is_current,
+};
 use payload::{PAYLOAD_LEN, Payload};
 use protocol::*;
 
@@ -92,23 +95,17 @@ fn rx_signed_boundary_array_and_dlc_decode() {
 
 #[test]
 fn controller_status_decodes_flags_and_preserves_unknown() {
-    let raw = 0b1110_1111;
-    let Ok(CanRxMessage::ControllerStatus {
-        status: ControllerStatus::Valid(flags),
-    }) = CanRxMessage::decode_standard(CAN_ID_CONTROLLER_STATUS, &[raw])
+    let raw = 0b1111_1111;
+    let Ok(CanRxMessage::ControllerStatus { status }) =
+        CanRxMessage::decode_standard(CAN_ID_CONTROLLER_STATUS, &[raw])
     else {
         return;
     };
-    assert_eq!(flags.raw(), raw);
-    assert!(flags.top_detected() && flags.main_power_on() && flags.emergency_power_on());
-    assert!(flags.control_active() && flags.sequence_active() && flags.liftoff_detected());
-    assert!(flags.parachute_motor_open());
-    assert_eq!(
-        CanRxMessage::decode_standard(CAN_ID_CONTROLLER_STATUS, &[0x10]),
-        Ok(CanRxMessage::ControllerStatus {
-            status: ControllerStatus::Unknown(0x10)
-        })
-    );
+    assert_eq!(status.raw(), raw);
+    assert_eq!(status.unknown_bits(), 1 << 4);
+    assert!(status.top_detected() && status.main_power_on() && status.emergency_power_on());
+    assert!(status.control_active() && status.sequence_active() && status.liftoff_detected());
+    assert!(status.parachute_motor_open());
     assert!(matches!(
         CanRxMessage::decode_standard(CAN_ID_CONTROLLER_STATUS, &[]),
         Err(CanDecodeError::InvalidDlc { .. })
@@ -163,7 +160,7 @@ fn request_and_tx_success_do_not_change_actual_status() {
     let queued = CommandRequestState::queue(1, GroundCommand::StartSequence);
     assert!(matches!(
         queued.mark_transmitted(1, 100),
-        CommandRequestState::AwaitingConfirmation { .. }
+        CommandRequestState::Transmitted { .. }
     ));
     assert_eq!(payload.status, 0);
 }
@@ -186,9 +183,26 @@ fn pending_completes_only_from_matching_controller_flags() {
     let emergency =
         CommandRequestState::queue(3, GroundCommand::EmergencyStopPara).mark_transmitted(3, 1000);
     assert_eq!(emergency.confirm(false, true), emergency);
+    assert_eq!(emergency.confirm(false, false), emergency);
+}
+
+#[test]
+fn already_satisfied_is_distinct_from_completed() {
+    assert!(command_already_satisfied(
+        GroundCommand::StartSequence,
+        true
+    ));
+    assert!(command_already_satisfied(
+        GroundCommand::StopSequence,
+        false
+    ));
+    assert!(!command_already_satisfied(
+        GroundCommand::StartSequence,
+        false
+    ));
     assert!(matches!(
-        emergency.confirm(false, false),
-        CommandRequestState::Completed { .. }
+        CommandRequestState::already_satisfied(4, GroundCommand::StartSequence),
+        CommandRequestState::AlreadySatisfied { .. }
     ));
 }
 
@@ -215,12 +229,8 @@ fn pending_timeout_and_supersede_preserve_actual_state() {
 
 #[test]
 fn controller_status_effects_are_edge_triggered() {
-    let Some(idle) = ControllerStatusFlags::from_raw(0) else {
-        return;
-    };
-    let Some(active) = ControllerStatusFlags::from_raw((1 << 5) | 1) else {
-        return;
-    };
+    let idle = ControllerStatus::from_raw(0);
+    let active = ControllerStatus::from_raw((1 << 5) | 1);
     assert_eq!(
         controller_status_effects(None, idle),
         ControllerStatusEffects {
@@ -242,6 +252,57 @@ fn controller_status_effects_are_edge_triggered() {
             top_rising: false
         }
     );
+}
+
+#[test]
+fn first_top_is_triggered_but_repeated_top_is_not() {
+    let top = ControllerStatus::from_raw(1);
+    assert!(controller_status_effects(None, top).top_rising);
+    assert!(!controller_status_effects(Some(top), top).top_rising);
+}
+
+#[test]
+fn recovering_queue_keeps_latest_category_and_prioritizes_emergency() {
+    assert!(!queued_request_is_current(
+        GroundCommand::StartSequence,
+        10,
+        11,
+        0,
+        0
+    ));
+    assert!(queued_request_is_current(
+        GroundCommand::StopSequence,
+        11,
+        11,
+        0,
+        0
+    ));
+    assert!(GroundCommand::EmergencyStopPara.priority() > GroundCommand::StopSequence.priority());
+    assert_eq!(
+        GroundCommand::EmergencyStopPara.priority(),
+        CommandPriority::SafetyCritical
+    );
+    assert!(!may_supersede(
+        GroundCommand::EmergencyStopPara,
+        GroundCommand::StopSequence
+    ));
+    assert!(may_supersede(
+        GroundCommand::StartSequence,
+        GroundCommand::EmergencyStopPara
+    ));
+}
+
+#[test]
+fn start_request_starts_sd_and_gnss_without_changing_payload_status() {
+    let payload = Payload::new();
+    let effects = GroundCommand::StartSequence.acceptance_effects();
+    assert_eq!(effects.logging_requested, Some(true));
+    assert!(effects.gnss_turn_on);
+    assert_eq!(payload.status, 0);
+
+    let controller = ControllerStatus::from_raw(1 << 5);
+    assert!(controller.sequence_active());
+    assert_eq!(controller.raw(), 1 << 5);
 }
 
 #[test]
