@@ -8,6 +8,16 @@ version      = "0.1.0"
 name = "c99l_comboard"
 path = "./src/bin/main.rs"
 
+[[test]]
+name = "lora_roundtrip_tx"
+path = "./test/lora_roundtrip_tx.rs"
+harness = false
+required-features = ["hardware-test"]
+
+[features]
+default = []
+hardware-test = []
+
 [dependencies]
 esp-hal = { version = "1.1.1", features = ["esp32s3", "unstable","log-04"] }
 

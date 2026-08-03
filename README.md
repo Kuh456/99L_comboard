@@ -139,3 +139,44 @@ CAN Bus OffではTWAIを再起動し、TEC/RECと連続エラーを別に記録�
 partial write、write/flush/read errorを処理し、AUXがHighでない場合も最大1000 msで
 復帰します。このAUX値は現行E220設定での実測確認が必要です。SD、GNSS、LoRaの各失敗は
 カウンタへ残り、asyncタスクをpanicまたは永久停止させません。
+
+## LoRa折り返し送信側試験
+
+`test/lora_roundtrip_tx.rs`はESP32-S3とE220-900T22S用の独立したハードウェア試験です。
+本番と同じUART2（TX GPIO11、RX GPIO12、115200 baud）、AUX GPIO8、M0 GPIO9、
+M1 GPIO10、39 byte Payload、宛先`00 00`、channel `04`を使用します。M0/M1はLowです。
+E220の固定／透過送信設定は不揮発設定に依存し、このプログラムからは変更しません。
+
+ダウンリンクではPayloadのstatus byteを8-bitの`downlink_sequence`として使用します。
+折り返し側から返す試験専用3 byteアプリケーションデータは次の形式です。本番用の
+`55 command (55 ^ command)`形式は変更していません。
+
+```text
+[0] command（s/q/z/l/m/E/o/c/g/h）
+[1] downlink_sequence
+[2] command ^ downlink_sequence
+```
+
+受信側はダウンリンクPayloadのoffset 4からsequenceを取り出し、`t_wait`後に上記3 byteを
+返してください。受信側MCUから固定送信する際に必要な宛先・channel 3 byteはE220への
+UART書き込み時だけ先頭へ追加し、無線上のアプリケーションデータはこの3 byteとします。
+送信側では1 byte目を受けてから20 ms以内に3 byteが揃わない応答をlength errorとして
+破棄します。
+
+ESP32-S3への書き込みとモニタは次のコマンドで行います。`hardware-test` featureを
+明示した場合だけ試験ファームウェアをビルドし、`.cargo/config.toml`のrunnerが
+`espflash`による書き込みとシリアルモニタを実行します。
+
+```console
+cargo test --test lora_roundtrip_tx --features hardware-test
+```
+
+実機へ書き込まず、コンパイルだけを確認する場合は`--no-run`を付けます。
+
+```console
+cargo test --test lora_roundtrip_tx --features hardware-test --no-run
+```
+
+各試行は`TEST,`、100周期ごとの集計は`SUMMARY,`で始まります。`success_bp`は成功率を
+basis point（10000 = 100%）で表します。CSVログ出力自体による遅延も
+`schedule_lateness_us`へ現れるため、測定時はUSBシリアルの受信を継続してください。
