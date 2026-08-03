@@ -11,10 +11,8 @@ pub const CAN_ID_OPEN_PARA: u16 = 0x30d;
 pub const CAN_ID_CLOSE_PARA: u16 = 0x30e;
 
 pub const CAN_ID_AIR_PRESSURE: u16 = 0x10a;
-pub const CAN_ID_LIFT_OFF: u16 = 0x110;
 pub const CAN_ID_ACCELERATION: u16 = 0x11a;
 pub const CAN_ID_ANGLE_SPEED: u16 = 0x120;
-pub const CAN_ID_TOP: u16 = 0x12a;
 pub const CAN_ID_FIN_ANGLE: u16 = 0x13a;
 pub const CAN_ID_ACCUMULATED_ANGLE: u16 = 0x14a;
 

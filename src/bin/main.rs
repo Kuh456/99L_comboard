@@ -47,6 +47,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 async fn main(spawner0: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
 
+    println!("boot");
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
@@ -60,7 +61,7 @@ async fn main(spawner0: Spawner) -> ! {
     let can_tx = Output::new(peripherals.GPIO7, Level::Low, OutputConfig::default());
     let can_rx = Input::new(peripherals.GPIO16, InputConfig::default());
     let mut led1 = Output::new(peripherals.GPIO6, Level::Low, OutputConfig::default());
-    let _led2 = Output::new(peripherals.GPIO15, Level::Low, OutputConfig::default());
+    let sd_logging_led = Output::new(peripherals.GPIO15, Level::Low, OutputConfig::default());
     let lora_tx = Output::new(peripherals.GPIO11, Level::Low, OutputConfig::default());
     let mut m0 = Output::new(peripherals.GPIO9, Level::Low, OutputConfig::default());
     let mut m1 = Output::new(peripherals.GPIO10, Level::Low, OutputConfig::default());
@@ -133,7 +134,7 @@ async fn main(spawner0: Spawner) -> ! {
 
     spawner0.spawn(gnss_manager_task(uart1, gnss_en).unwrap());
     // Keep blocking SD traffic off the core reserved for LoRa and optional CAN tasks.
-    spawner0.spawn(sd_write_task(volume_mgr).unwrap());
+    spawner0.spawn(sd_write_task(volume_mgr, sd_logging_led).unwrap());
 
     esp_rtos::start_second_core(
         peripherals.CPU_CTRL,

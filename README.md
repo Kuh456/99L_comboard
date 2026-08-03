@@ -3,28 +3,70 @@
 ESP32-S3上でLoRa地上局コマンドをCANへ中継し、CANテレメトリとGNSSを39 byteの
 `Payload`にまとめてLoRa送信し、同じテレメトリをSDへCSV記録する通信基板です。
 
-## 状態の権威
+## 状態の決定
 
 シーケンスおよび制御基板の実状態は、CAN ID `0x200` の制御基板ステータスからのみ
 決定します。LoRaコマンドは要求、CAN送信成功はバスへ送れたことを示すだけです。
 いずれも実状態や`Payload.status`、シーケンス連動のGNSS/SD状態を直接変更しません。
 
-## CAN ID 0x200
+## CAN protocol
+
+CAN 2.0の11-bit標準IDを使用し、通信速度は125 kbpsです。拡張IDのフレーム、未定義ID、
+および表と異なるDLCは受理しません。コマンドは通信基板から各制御基板へ送信し、
+テレメトリとステータスは各制御基板から通信基板が受信します。
+
+### 送信コマンド
+
+すべてDLC 1で、data[0]にはLoRaコマンドと同じASCII byteを格納します。残りのbyteは
+CANフレームへ含めません。`g` / `h`は通信基板内のGNSS操作専用で、CANへは送信しません。
+
+|  CAN ID |      data[0] | コマンド                 |
+| ------: | -----------: | ------------------------ |
+| `0x001` | `0x45` (`E`) | fin control stop         |
+| `0x003` | `0x7a` (`z`) | parachute emergency stop |
+| `0x005` | `0x73` (`s`) | sequence start           |
+| `0x00a` | `0x71` (`q`) | sequence stop            |
+| `0x011` | `0x6c` (`l`) | logging start            |
+| `0x01e` | `0x6d` (`m`) | logging stop             |
+| `0x30d` | `0x6f` (`o`) | parachute open           |
+| `0x30e` | `0x63` (`c`) | parachute close          |
+
+CANのIDが小さいほどバス調停上の優先度は高くなります。`0x30d` / `0x30e`は現在の
+指定値であり、緊急停止`0x003`より低い優先度です。
+
+### 受信テレメトリ
+
+|  CAN ID | DLC | data形式                                       | 通信基板での扱い                             |
+| ------: | --: | ---------------------------------------------- | -------------------------------------------- |
+| `0x10a` |   3 | `[pressure0, pressure1, pressure2]` (`u8 × 3`) | Payload `air_pressure[0..3]`へコピー         |
+| `0x11a` |   6 | `X, Y, Z: i16`                                 | Payload `acceleration`へコピー               |
+| `0x120` |   6 | `X, Y, Z: i16`                                 | Payload `angle_speed`へコピー                |
+| `0x13a` |   6 | `X, Y, Z: i16`                                 | Payloadとの対応が未定義のため破棄数のみ記録  |
+| `0x14a` |   6 | `X, Y, Z: i16`                                 | Payload `integrated_angle`へコピー           |
+| `0x200` |   1 | status bitfield                                | 制御基板の実状態およびPayload `status`へ反映 |
+
+3軸の`i16`値は符号付きbig endianです。data[0..2]がX、data[2..4]がY、
+data[4..6]がZで、各軸は上位byte、下位byteの順です。例として
+`[0x00, 0x01, 0xff, 0xff, 0x7f, 0xff]`は`[1, -1, 32767]`になります。
+AirPressureの3 byteは数値へ結合せず、そのままPayloadへ保持します。物理単位、倍率、
+送信周期は現時点のコードでは定義していません。
+
+### CAN ID 0x200
 
 制御基板から通信基板への標準ID、DLC 1の受信専用メッセージです。1 byteをphaseと
 flagsに分割する根拠は確認できておらず、現在確認できる仕様は次のbitfieldだけです。
 通信基板の送信型にはこのIDが存在しないため、復旧probeとして送ることもできません。
 
-| bit | 意味 | 1の意味 |
-|---:|---|---|
-| 0 | TOP | 検出済み |
-| 1 | main power | ON |
-| 2 | emergency power | ON |
-| 3 | control active | active |
-| 4 | reserved | 未知bitとしてrawに保持 |
-| 5 | sequence active | active |
-| 6 | liftoff | 検出済み |
-| 7 | parachute motor | open |
+| bit | 意味            | 1の意味                |
+| --: | --------------- | ---------------------- |
+|   0 | TOP             | 検出済み               |
+|   1 | main power      | ON                     |
+|   2 | emergency power | ON                     |
+|   3 | control active  | active                 |
+|   4 | reserved        | 未知bitとしてrawに保持 |
+|   5 | sequence active | active                 |
+|   6 | liftoff         | 検出済み               |
+|   7 | parachute motor | open                   |
 
 byte内はLSBをbit 0とします。複数byte値はありません。独立したphase値、fault flags、
 送信周期、起動時の送信値、状態ラッチ仕様は未確定です。未知bitはrawに保持しつつ、
@@ -37,16 +79,25 @@ CAN controllerのTEC/REC/Bus Off healthとは別の状態です。
 
 ## LoRaコマンド
 
-既存の1 byteストリーム互換を維持し、1回のUART readに含まれる全byteを順に処理します。
+UARTアップリンクは固定3 byteフレームです。旧1 byteコマンドは受理しません。
 
-| byte | 要求 |
-|---|---|
-| `s` / `q` | sequence start / stop |
-| `z` | parachute emergency stop |
+```text
+[0] Header   = 0x55
+[1] Command
+[2] Checksum = Header ^ Command
+```
+
+Headerまたはchecksumが一致しないフレームは破棄します。UARTの分割受信と連続フレームに
+対応し、正常なフレームのCommandだけを次の表に従って処理します。
+
+| byte      | 要求                             |
+| --------- | -------------------------------- |
+| `s` / `q` | sequence start / stop            |
+| `z`       | parachute emergency stop         |
 | `l` / `m` | CAN logging start / stop command |
-| `E` | fin control stop |
-| `o` / `c` | parachute open / close |
-| `g` / `h` | GNSS manual on / off |
+| `E`       | fin control stop                 |
+| `o` / `c` | parachute open / close           |
+| `g` / `h` | GNSS manual on / off             |
 
 未知byteは無視します。`s`、`q`はqueued → transmitted → confirmed/failedへ進み、
 confirmedはそれぞれ0x200のsequence bit ON、OFFで成立します。要求時点ですでに目標bitなら
