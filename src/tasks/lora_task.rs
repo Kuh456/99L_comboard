@@ -1,13 +1,17 @@
 use core::sync::atomic::Ordering;
 
 use embassy_futures::select::{Either3, select3};
-use embassy_time::{Duration, Instant, Ticker, Timer};
-use esp_hal::{Async, gpio::Input, uart::Uart};
+use embassy_time::{Duration, Instant, Ticker, with_timeout};
+use esp_hal::{
+    Async,
+    gpio::Input,
+    uart::{TxError, Uart},
+};
 use esp_println::println;
 
 use crate::{
     can::protocol::ComboardCanMessage,
-    constants::LORA_TRANSMIT_INTERVAL_MS,
+    constants::{LORA_AUX_TIMEOUT_MS, LORA_TRANSMIT_INTERVAL_MS},
     state::{
         CAN_TX_CHANNEL, GNSS_CMD_CHANNEL, GnssCommand, IS_LOGGING, LAST_SEEN_LOG, PAYLOAD_MUTEX,
         RECEIVED_DATA_CHANNEL, SD_FLUSH_SIGNAL, TRIGGER_SIGNAL,
@@ -22,7 +26,70 @@ const fn get_target_can_message(cmd: u8) -> Option<ComboardCanMessage> {
         b'm' => Some(ComboardCanMessage::StopLogging { command: cmd }),
         b'z' => Some(ComboardCanMessage::EmergencyStopPara { command: cmd }),
         b'E' => Some(ComboardCanMessage::StopFinControl { command: cmd }),
+        b'c' => Some(ComboardCanMessage::ClosePara { command: cmd }),
+        b'o' => Some(ComboardCanMessage::OpenPara { command: cmd }),
         _ => None,
+    }
+}
+
+const fn is_supported_command(command: u8) -> bool {
+    matches!(
+        command,
+        b's' | b'q' | b'l' | b'm' | b'g' | b'h' | b'z' | b'E' | b'c' | b'o'
+    )
+}
+
+async fn write_all(uart: &mut Uart<'static, Async>, mut bytes: &[u8]) -> Result<bool, TxError> {
+    while !bytes.is_empty() {
+        let written = uart.write_async(bytes).await?;
+        if written == 0 {
+            println!("LoRa UART write made no progress");
+            return Ok(false);
+        }
+        bytes = &bytes[written..];
+    }
+    Ok(true)
+}
+
+async fn transmit_latest_payload(uart: &mut Uart<'static, Async>, aux_pin: &mut Input<'static>) {
+    let log_is_fresh = match *LAST_SEEN_LOG.lock().await {
+        Some(last_seen) => Instant::now().duration_since(last_seen).as_secs() < 80,
+        None => false,
+    };
+
+    let payload_bytes = {
+        let mut payload = PAYLOAD_MUTEX.lock().await;
+        if log_is_fresh {
+            payload.status |= 0b0000_1000;
+        } else {
+            payload.status &= 0b1111_0111;
+        }
+        payload.check_sum = payload.calculate_checksum();
+        payload.to_bytes()
+    };
+
+    match write_all(uart, &payload_bytes).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            println!("LoRa UART write error: {:?}", error);
+            return;
+        }
+    }
+    if let Err(error) = uart.flush_async().await {
+        println!("LoRa UART flush error: {:?}", error);
+        return;
+    }
+
+    if aux_pin.is_low()
+        && with_timeout(
+            Duration::from_millis(LORA_AUX_TIMEOUT_MS),
+            aux_pin.wait_for_high(),
+        )
+        .await
+        .is_err()
+    {
+        println!("LoRa AUX timeout");
     }
 }
 
@@ -74,50 +141,25 @@ pub async fn lora_task(mut uart: Uart<'static, Async>, mut aux_pin: Input<'stati
         )
         .await
         {
-            Either3::First(_trigger) => {}
+            Either3::First(_trigger) => {
+                transmit_latest_payload(&mut uart, &mut aux_pin).await;
+            }
             Either3::Second(Ok(len)) => {
                 if len > 0 {
                     println!("cmd: {:?}", &rx_buf[..len]);
-                    RECEIVED_DATA_CHANNEL.send(rx_buf[0]).await;
+                    for &command in &rx_buf[..len] {
+                        if is_supported_command(command) {
+                            RECEIVED_DATA_CHANNEL.send(command).await;
+                        }
+                    }
                 }
             }
-            Either3::Second(Err(_)) => {}
+            Either3::Second(Err(error)) => {
+                println!("LoRa UART receive error: {:?}", error);
+            }
             Either3::Third(_) => {
-                let payload = {
-                    let mut payload = PAYLOAD_MUTEX.lock().await;
-                    payload.check_sum = payload.calculate_checksum();
-                    *payload
-                };
-                let payload_bytes = payload.to_bytes();
-
-                let _ = uart.write_async(&payload_bytes).await;
-                let _ = uart.flush();
-
-                aux_pin.wait_for_high().await;
+                transmit_latest_payload(&mut uart, &mut aux_pin).await;
             }
         }
-    }
-}
-
-#[embassy_executor::task]
-pub async fn create_lora_payload() {
-    loop {
-        {
-            let mut payload = PAYLOAD_MUTEX.lock().await;
-            let now = Instant::now();
-            let is_timeout = |last_seen: Option<Instant>| -> bool {
-                match last_seen {
-                    Some(time) => now.duration_since(time).as_secs() >= 80,
-                    None => true,
-                }
-            };
-
-            if is_timeout(*LAST_SEEN_LOG.lock().await) {
-                payload.status &= 0b1111_0111;
-            }
-            payload.check_sum = payload.calculate_checksum();
-        }
-
-        Timer::after(Duration::from_millis(100)).await;
     }
 }

@@ -1,4 +1,8 @@
-use esp_hal::{Async, uart::Uart};
+use esp_hal::{
+    Async,
+    uart::{TxError, Uart},
+};
+use esp_println::println;
 
 type GnssUart = Uart<'static, Async>;
 
@@ -45,21 +49,35 @@ const INIT_COMMANDS: &[&[u8]] = &[
     UART_BAUD,
 ];
 
-async fn send_cmd(tx: &mut GnssUart, mut data: &[u8]) {
+async fn send_cmd(tx: &mut GnssUart, mut data: &[u8]) -> Result<bool, TxError> {
     while !data.is_empty() {
         match tx.write_async(data).await {
-            Ok(0) | Err(_) => break,
+            Ok(0) => return Ok(false),
+            Err(error) => return Err(error),
             Ok(written) => {
                 data = &data[written..];
             }
         }
     }
+    Ok(true)
 }
 
 pub async fn gnss_setting(tx: &mut GnssUart) {
     for &cmd in INIT_COMMANDS {
-        send_cmd(tx, cmd).await;
+        match send_cmd(tx, cmd).await {
+            Ok(true) => {}
+            Ok(false) => {
+                println!("GNSS UART write made no progress");
+                return;
+            }
+            Err(error) => {
+                println!("GNSS UART write error: {:?}", error);
+                return;
+            }
+        }
     }
 
-    let _ = tx.flush_async().await;
+    if let Err(error) = tx.flush_async().await {
+        println!("GNSS UART flush error: {:?}", error);
+    }
 }

@@ -1,7 +1,7 @@
 use core::sync::atomic::Ordering;
 
-use embassy_futures::select::{Either4, select4};
-use embassy_time::{Duration, Ticker};
+use embassy_futures::select::{Either3, select3};
+use embassy_time::{Duration, Instant, Ticker};
 use embedded_can::{Frame, Id};
 use esp_hal::{
     Async,
@@ -15,26 +15,29 @@ use crate::{
         protocol::ComboardCanMessage,
         tx::{CanTxError, transmit_message_with_timeout},
     },
-    constants::{CAN_HEALTH_MONITOR_INTERVAL_MS, CAN_PROBE_INTERVAL_MS, CAN_TX_TIMEOUT_MS},
+    constants::{
+        CAN_CONSECUTIVE_ERROR_THRESHOLD, CAN_HEALTH_MONITOR_INTERVAL_MS, CAN_TX_TIMEOUT_MS,
+    },
     state::{
         CAN_HEALTH, CAN_REC, CAN_RX_ERROR_COUNT, CAN_TEC, CAN_TX_CHANNEL, CAN_TX_ERROR_COUNT,
-        IS_CAN_ERROR, PAYLOAD_MUTEX, TRIGGER_SIGNAL,
+        IS_CAN_ERROR, LAST_SEEN_LOG, PAYLOAD_MUTEX, TRIGGER_SIGNAL,
     },
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CanRuntimeState {
+    AwaitingTraffic,
     Normal,
-    Recovering,
+    BusRecovering,
+    TxStateUnknown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CanRuntimeEvent {
     TransmitSucceeded,
+    ReceiveSucceeded,
     BusOff,
     TimedOutUnknownState,
-    ProbeSucceeded,
-    ProbeFailed,
 }
 
 const fn transition_runtime(
@@ -43,10 +46,32 @@ const fn transition_runtime(
 ) -> (CanRuntimeState, bool) {
     match (state, event) {
         (
-            CanRuntimeState::Normal,
-            CanRuntimeEvent::BusOff | CanRuntimeEvent::TimedOutUnknownState,
-        ) => (CanRuntimeState::Recovering, true),
-        (CanRuntimeState::Recovering, CanRuntimeEvent::ProbeSucceeded) => {
+            CanRuntimeState::AwaitingTraffic,
+            CanRuntimeEvent::TransmitSucceeded | CanRuntimeEvent::ReceiveSucceeded,
+        ) => (CanRuntimeState::Normal, false),
+        (CanRuntimeState::AwaitingTraffic, CanRuntimeEvent::BusOff) => {
+            (CanRuntimeState::BusRecovering, true)
+        }
+        (CanRuntimeState::AwaitingTraffic, CanRuntimeEvent::TimedOutUnknownState) => {
+            (CanRuntimeState::TxStateUnknown, true)
+        }
+        (CanRuntimeState::Normal, CanRuntimeEvent::BusOff) => {
+            (CanRuntimeState::BusRecovering, true)
+        }
+        (CanRuntimeState::Normal, CanRuntimeEvent::TimedOutUnknownState) => {
+            (CanRuntimeState::TxStateUnknown, true)
+        }
+        (CanRuntimeState::TxStateUnknown, CanRuntimeEvent::BusOff) => {
+            (CanRuntimeState::BusRecovering, false)
+        }
+        (CanRuntimeState::BusRecovering, CanRuntimeEvent::TimedOutUnknownState) => {
+            (CanRuntimeState::TxStateUnknown, false)
+        }
+        (
+            CanRuntimeState::BusRecovering | CanRuntimeState::TxStateUnknown,
+            CanRuntimeEvent::TransmitSucceeded,
+        ) => (CanRuntimeState::Normal, false),
+        (CanRuntimeState::BusRecovering, CanRuntimeEvent::ReceiveSucceeded) => {
             (CanRuntimeState::Normal, false)
         }
         (state, _) => (state, false),
@@ -68,14 +93,6 @@ fn enter_recovering(
     (can, next_state, restart_required)
 }
 
-fn drain_pending_commands() -> usize {
-    let mut dropped = 0;
-    while CAN_TX_CHANNEL.try_receive().is_ok() {
-        dropped += 1;
-    }
-    dropped
-}
-
 fn publish_health(can: &twai::Twai<'static, Async>) -> CanHealth {
     let tec = can.transmit_error_count();
     let rec = can.receive_error_count();
@@ -88,9 +105,17 @@ fn publish_health(can: &twai::Twai<'static, Async>) -> CanHealth {
     health
 }
 
-fn publish_error_state(state: CanRuntimeState, health: CanHealth) {
+fn publish_error_state(
+    state: CanRuntimeState,
+    health: CanHealth,
+    consecutive_tx_errors: u8,
+    consecutive_rx_errors: u8,
+) {
     IS_CAN_ERROR.store(
-        state != CanRuntimeState::Normal || health != CanHealth::Active,
+        state != CanRuntimeState::Normal
+            || health != CanHealth::Active
+            || consecutive_tx_errors >= CAN_CONSECUTIVE_ERROR_THRESHOLD
+            || consecutive_rx_errors >= CAN_CONSECUTIVE_ERROR_THRESHOLD,
         Ordering::Relaxed,
     );
 }
@@ -102,9 +127,11 @@ async fn apply_received_message(message: ComboardCanMessage) {
             payload.status = (payload.status & 0b1011_1111) | 0b0100_0000;
         }
         ComboardCanMessage::Top { .. } => {
+            {
+                let mut payload = PAYLOAD_MUTEX.lock().await;
+                payload.status = (payload.status & 0b0111_1111) | 0b1000_0000;
+            }
             TRIGGER_SIGNAL.signal(true);
-            let mut payload = PAYLOAD_MUTEX.lock().await;
-            payload.status = (payload.status & 0b0111_1111) | 0b1000_0000;
         }
         ComboardCanMessage::AngleSpeed { xyz } => {
             PAYLOAD_MUTEX.lock().await.angle_speed = xyz;
@@ -121,8 +148,12 @@ async fn apply_received_message(message: ComboardCanMessage) {
         // The protocol contains three i16 fin values, while Payload has one i8
         // field. Do not guess which value or narrowing rule should be used.
         ComboardCanMessage::FinAngle { .. } => {}
-        // Payload has no unambiguous phase/flags destination.
-        ComboardCanMessage::IntegratedBoardStatus { .. } => {}
+        // 0x200 is the log-board heartbeat; phase/flags have no Payload mapping.
+        ComboardCanMessage::IntegratedBoardStatus { .. } => {
+            *LAST_SEEN_LOG.lock().await = Some(Instant::now());
+            let mut payload = PAYLOAD_MUTEX.lock().await;
+            payload.status |= 0b0000_1000;
+        }
         // Command frames are transmitted by this board and have no RX side effect.
         ComboardCanMessage::StopFinControl { .. }
         | ComboardCanMessage::EmergencyStopPara { .. }
@@ -154,45 +185,32 @@ async fn handle_received_frame(frame: EspTwaiFrame) {
     }
 }
 
-fn probe_message() -> ComboardCanMessage {
-    // Existing status/heartbeat ID; zero values have no actuator side effect.
-    ComboardCanMessage::IntegratedBoardStatus { phase: 0, flags: 0 }
-}
-
 #[embassy_executor::task]
 pub async fn can_communication_task(mut can: twai::Twai<'static, Async>) {
-    let mut runtime_state = CanRuntimeState::Normal;
-    let mut probe_ticker = Ticker::every(Duration::from_millis(CAN_PROBE_INTERVAL_MS));
+    let mut runtime_state = CanRuntimeState::AwaitingTraffic;
     let mut health_ticker = Ticker::every(Duration::from_millis(CAN_HEALTH_MONITOR_INTERVAL_MS));
     let tx_timeout = Duration::from_millis(CAN_TX_TIMEOUT_MS);
+    let mut consecutive_tx_errors = 0u8;
+    let mut consecutive_rx_errors = 0u8;
 
     loop {
-        match select4(
-            probe_ticker.next(),
+        match select3(
             health_ticker.next(),
             CAN_TX_CHANNEL.receive(),
             can.receive_async(),
         )
         .await
         {
-            Either4::Third(message) => {
-                if runtime_state == CanRuntimeState::Recovering {
-                    let dropped = 1 + drain_pending_commands();
-                    println!(
-                        "dropping {} CAN command(s) while recovering; first: {:?}",
-                        dropped, message
-                    );
-                    continue;
-                }
-
+            Either3::Second(message) => {
                 match transmit_message_with_timeout(&mut can, message, tx_timeout).await {
                     Ok(()) => {
+                        consecutive_tx_errors = 0;
                         runtime_state =
                             transition_runtime(runtime_state, CanRuntimeEvent::TransmitSucceeded).0;
                     }
                     Err(error) => {
                         CAN_TX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
-                        IS_CAN_ERROR.store(true, Ordering::Relaxed);
+                        consecutive_tx_errors = consecutive_tx_errors.saturating_add(1);
                         println!("CAN transmit error: {:?}", error);
 
                         if matches!(error, CanTxError::BusOff | CanTxError::TimedOutUnknownState) {
@@ -205,18 +223,36 @@ pub async fn can_communication_task(mut can: twai::Twai<'static, Async>) {
                             can = recovery.0;
                             runtime_state = recovery.1;
                             if recovery.2 {
-                                let dropped = drain_pending_commands();
-                                println!("TWAI restarted; dropped {} queued commands", dropped);
+                                println!("TWAI restarted after transmit failure");
                             }
                         }
                     }
                 }
+                let health = publish_health(&can);
+                publish_error_state(
+                    runtime_state,
+                    health,
+                    consecutive_tx_errors,
+                    consecutive_rx_errors,
+                );
             }
-            Either4::Fourth(result) => match result {
-                Ok(frame) => handle_received_frame(frame).await,
+            Either3::Third(result) => match result {
+                Ok(frame) => {
+                    consecutive_rx_errors = 0;
+                    runtime_state =
+                        transition_runtime(runtime_state, CanRuntimeEvent::ReceiveSucceeded).0;
+                    handle_received_frame(frame).await;
+                    let health = publish_health(&can);
+                    publish_error_state(
+                        runtime_state,
+                        health,
+                        consecutive_tx_errors,
+                        consecutive_rx_errors,
+                    );
+                }
                 Err(error) => {
                     CAN_RX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
-                    IS_CAN_ERROR.store(true, Ordering::Relaxed);
+                    consecutive_rx_errors = consecutive_rx_errors.saturating_add(1);
                     println!("CAN receive error: {:?}", error);
 
                     if error == EspTwaiError::BusOff {
@@ -225,46 +261,34 @@ pub async fn can_communication_task(mut can: twai::Twai<'static, Async>) {
                         can = recovery.0;
                         runtime_state = recovery.1;
                         if recovery.2 {
-                            let dropped = drain_pending_commands();
-                            println!("TWAI restarted; dropped {} queued commands", dropped);
+                            println!("TWAI restarted after receive failure");
                         }
                     }
+                    let health = publish_health(&can);
+                    publish_error_state(
+                        runtime_state,
+                        health,
+                        consecutive_tx_errors,
+                        consecutive_rx_errors,
+                    );
                 }
             },
-            Either4::First(_) => {
-                if runtime_state == CanRuntimeState::Recovering {
-                    match transmit_message_with_timeout(&mut can, probe_message(), tx_timeout).await
-                    {
-                        Ok(()) => {
-                            runtime_state =
-                                transition_runtime(runtime_state, CanRuntimeEvent::ProbeSucceeded)
-                                    .0;
-                            let health = publish_health(&can);
-                            publish_error_state(runtime_state, health);
-                            println!("CAN probe succeeded; normal operation resumed");
-                        }
-                        Err(error) => {
-                            CAN_TX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
-                            IS_CAN_ERROR.store(true, Ordering::Relaxed);
-                            runtime_state =
-                                transition_runtime(runtime_state, CanRuntimeEvent::ProbeFailed).0;
-                            println!("CAN probe failed: {:?}", error);
-                        }
-                    }
-                }
-            }
-            Either4::Second(_) => {
+            Either3::First(_) => {
                 let health = publish_health(&can);
                 if health == CanHealth::BusOff {
                     let recovery = enter_recovering(can, runtime_state, CanRuntimeEvent::BusOff);
                     can = recovery.0;
                     runtime_state = recovery.1;
                     if recovery.2 {
-                        let dropped = drain_pending_commands();
-                        println!("TWAI restarted; dropped {} queued commands", dropped);
+                        println!("TWAI restarted after health monitor detected Bus Off");
                     }
                 }
-                publish_error_state(runtime_state, health);
+                publish_error_state(
+                    runtime_state,
+                    health,
+                    consecutive_tx_errors,
+                    consecutive_rx_errors,
+                );
             }
         }
     }

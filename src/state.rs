@@ -16,9 +16,6 @@ pub enum GnssCommand {
 }
 
 pub static LAST_SEEN_LOG: Mutex<CriticalSectionRawMutex, Option<Instant>> = Mutex::new(None);
-pub static LAST_SEEN_CAMERA: Mutex<CriticalSectionRawMutex, Option<Instant>> = Mutex::new(None);
-// pub static LAST_SEEN_POWER: Mutex<CriticalSectionRawMutex, Option<Instant>> = Mutex::new(None);
-
 pub static TRIGGER_SIGNAL: Signal<CriticalSectionRawMutex, bool> = Signal::new();
 pub static GNSS_CHANNEL: Channel<CriticalSectionRawMutex, GnssPacket, 5> = Channel::new();
 pub static RECEIVED_DATA_CHANNEL: Channel<CriticalSectionRawMutex, u8, 10> = Channel::new();
@@ -26,7 +23,7 @@ pub static PAYLOAD_MUTEX: Mutex<CriticalSectionRawMutex, Payload> = Mutex::new(P
 pub static IS_LOGGING: AtomicBool = AtomicBool::new(false);
 pub static HAS_UNFLUSHED_DATA: AtomicBool = AtomicBool::new(false);
 pub static SD_FLUSH_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
-pub static CAN_TX_CHANNEL: Channel<CriticalSectionRawMutex, ComboardCanMessage, 5> = Channel::new();
+pub static CAN_TX_CHANNEL: Channel<CriticalSectionRawMutex, ComboardCanMessage, 8> = Channel::new();
 pub static IS_CAN_ERROR: AtomicBool = AtomicBool::new(true);
 pub static CAN_TEC: AtomicU8 = AtomicU8::new(0);
 pub static CAN_REC: AtomicU8 = AtomicU8::new(0);
