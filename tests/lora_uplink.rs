@@ -26,11 +26,39 @@ fn rejects_wrong_checksum() {
 }
 
 #[test]
+fn resynchronizes_at_the_next_header_after_garbage() {
+    let mut buffer = UplinkFrameBuffer::new();
+    assert_eq!(
+        collect_commands(&mut buffer, &[0x00, 0xff, 0x55, b's', 0x26]),
+        [b's']
+    );
+}
+
+#[test]
+fn checksum_failure_can_end_with_the_next_header() {
+    let mut buffer = UplinkFrameBuffer::new();
+    assert_eq!(
+        collect_commands(&mut buffer, &[0x55, b's', 0x55, b'q', 0x24]),
+        [b'q']
+    );
+}
+
+#[test]
 fn accepts_split_frame() {
     let mut buffer = UplinkFrameBuffer::new();
     assert!(collect_commands(&mut buffer, &[0x55]).is_empty());
     assert!(collect_commands(&mut buffer, &[b's']).is_empty());
     assert_eq!(collect_commands(&mut buffer, &[0x26]), [b's']);
+}
+
+#[test]
+fn reset_discards_a_partial_frame() {
+    let mut buffer = UplinkFrameBuffer::new();
+    assert!(buffer.push(0x55).is_none());
+
+    buffer.reset();
+
+    assert_eq!(collect_commands(&mut buffer, &[0x55, b'q', 0x24]), [b'q']);
 }
 
 #[test]

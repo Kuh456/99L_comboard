@@ -90,6 +90,10 @@ UARTアップリンクは固定3 byteフレームです。旧1 byteコマンド�
 Headerまたはchecksumが一致しないフレームは破棄します。UARTの分割受信と連続フレームに
 対応し、正常なフレームのCommandだけを次の表に従って処理します。
 
+機体側は250 ms周期とTOP立上り時にテレメトリを送信します。UARTはRX/TXへ分割し、RXは
+送信処理やAUX待機と独立したタスクで常時読み出します。不正フレームおよびUART受信エラー
+発生時は組み立て途中のフレームを破棄し、次のHeaderから再同期します。
+
 | byte      | 要求                             |
 | --------- | -------------------------------- |
 | `s` / `q` | sequence start / stop            |
@@ -140,43 +144,18 @@ partial write、write/flush/read errorを処理し、AUXがHighでない場合�
 復帰します。このAUX値は現行E220設定での実測確認が必要です。SD、GNSS、LoRaの各失敗は
 カウンタへ残り、asyncタスクをpanicまたは永久停止させません。
 
-## LoRa折り返し送信側試験
+## GNSS設定応答実機テスト
 
-`test/lora_roundtrip_tx.rs`はESP32-S3とE220-900T22S用の独立したハードウェア試験です。
-本番と同じUART2（TX GPIO11、RX GPIO12、115200 baud）、AUX GPIO8、M0 GPIO9、
-M1 GPIO10、39 byte Payload、宛先`00 00`、channel `04`を使用します。M0/M1はLowです。
-E220の固定／透過送信設定は不揮発設定に依存し、このプログラムからは変更しません。
-
-ダウンリンクではPayloadのstatus byteを8-bitの`downlink_sequence`として使用します。
-折り返し側から返す試験専用3 byteアプリケーションデータは次の形式です。本番用の
-`55 command (55 ^ command)`形式は変更していません。
-
-```text
-[0] command（s/q/z/l/m/E/o/c/g/h）
-[1] downlink_sequence
-[2] command ^ downlink_sequence
-```
-
-受信側はダウンリンクPayloadのoffset 4からsequenceを取り出し、`t_wait`後に上記3 byteを
-返してください。受信側MCUから固定送信する際に必要な宛先・channel 3 byteはE220への
-UART書き込み時だけ先頭へ追加し、無線上のアプリケーションデータはこの3 byteとします。
-送信側では1 byte目を受けてから20 ms以内に3 byteが揃わない応答をlength errorとして
-破棄します。
-
-ESP32-S3への書き込みとモニタは次のコマンドで行います。`hardware-test` featureを
-明示した場合だけ試験ファームウェアをビルドし、`.cargo/config.toml`のrunnerが
-`espflash`による書き込みとシリアルモニタを実行します。
+`test/gnss_setting_response.rs`は、本番と同じUART1（TX GPIO14、RX GPIO21）、9600 baud、
+8N1でGNSSを起動し、現在の`INIT_COMMANDS`と同じ設定を同じ順序で送信します。送受信byteを
+HEXとASCIIで表示し、最後の`UART_BAUD`送信から50 ms後にESP32側も115200 baudへ変更します。
 
 ```console
-cargo test --test lora_roundtrip_tx --features hardware-test
+cargo test --test gnss_setting_response --features hardware-test
 ```
 
-実機へ書き込まず、コンパイルだけを確認する場合は`--no-run`を付けます。
+実機へ書き込まず型検査だけを行う場合は次を実行します。
 
 ```console
-cargo test --test lora_roundtrip_tx --features hardware-test --no-run
+cargo check --test gnss_setting_response --features hardware-test
 ```
-
-各試行は`TEST,`、100周期ごとの集計は`SUMMARY,`で始まります。`success_bp`は成功率を
-basis point（10000 = 100%）で表します。CSVログ出力自体による遅延も
-`schedule_lateness_us`へ現れるため、測定時はUSBシリアルの受信を継続してください。

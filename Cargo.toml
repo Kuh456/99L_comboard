@@ -9,8 +9,8 @@ name = "c99l_comboard"
 path = "./src/bin/main.rs"
 
 [[test]]
-name = "lora_roundtrip_tx"
-path = "./test/lora_roundtrip_tx.rs"
+name = "gnss_setting_response"
+path = "./test/gnss_setting_response.rs"
 harness = false
 required-features = ["hardware-test"]
 

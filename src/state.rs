@@ -108,6 +108,7 @@ pub static CAN_TX_ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static CAN_RX_ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static LORA_TX_ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static LORA_RX_ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static LORA_COMMAND_DROP_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static LORA_AUX_TIMEOUT_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static GNSS_SETTING_ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static GNSS_RX_ERROR_COUNT: AtomicU32 = AtomicU32::new(0);

@@ -1,11 +1,11 @@
 use core::sync::atomic::Ordering;
 
-use embassy_futures::select::{Either3, select3};
+use embassy_futures::select::select;
 use embassy_time::{Duration, Ticker, with_timeout};
 use esp_hal::{
     Async,
     gpio::Input,
-    uart::{TxError, Uart},
+    uart::{RxError, TxError, UartRx, UartTx},
 };
 use esp_println::println;
 
@@ -24,8 +24,8 @@ use crate::{
         CONTROLLER_STATUS_RAW, CanTxRequest, GNSS_CMD_CHANNEL, GnssCommand,
         HAS_VALID_CONTROLLER_STATUS, LAST_COMMAND_FAILURE, LATEST_LOGGING_GENERATION,
         LATEST_PARA_POSITION_GENERATION, LATEST_SEQUENCE_GENERATION, LOGGING_REQUESTED,
-        LORA_AUX_TIMEOUT_COUNT, LORA_RX_ERROR_COUNT, LORA_TX_ERROR_COUNT, PAYLOAD_MUTEX,
-        RECEIVED_DATA_CHANNEL, SD_FLUSH_SIGNAL, TRIGGER_SIGNAL,
+        LORA_AUX_TIMEOUT_COUNT, LORA_COMMAND_DROP_COUNT, LORA_RX_ERROR_COUNT, LORA_TX_ERROR_COUNT,
+        PAYLOAD_MUTEX, RECEIVED_DATA_CHANNEL, SD_FLUSH_SIGNAL, TRIGGER_SIGNAL,
     },
 };
 
@@ -43,9 +43,9 @@ const fn get_target_can_message(command: GroundCommand) -> Option<CanTxMessage> 
     }
 }
 
-async fn write_all(uart: &mut Uart<'static, Async>, mut bytes: &[u8]) -> Result<bool, TxError> {
+async fn write_all(tx: &mut UartTx<'static, Async>, mut bytes: &[u8]) -> Result<bool, TxError> {
     while !bytes.is_empty() {
-        let written = uart.write_async(bytes).await?;
+        let written = tx.write_async(bytes).await?;
         if written == 0 {
             println!("LoRa UART write made no progress");
             return Ok(false);
@@ -55,14 +55,14 @@ async fn write_all(uart: &mut Uart<'static, Async>, mut bytes: &[u8]) -> Result<
     Ok(true)
 }
 
-async fn transmit_latest_payload(uart: &mut Uart<'static, Async>, aux_pin: &mut Input<'static>) {
+async fn transmit_latest_payload(tx: &mut UartTx<'static, Async>, aux_pin: &mut Input<'static>) {
     let payload_bytes = {
         let mut payload = PAYLOAD_MUTEX.lock().await;
         payload.check_sum = payload.calculate_checksum();
         payload.to_bytes()
     };
 
-    match write_all(uart, &payload_bytes).await {
+    match write_all(tx, &payload_bytes).await {
         Ok(true) => {}
         Ok(false) => {
             LORA_TX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -74,7 +74,7 @@ async fn transmit_latest_payload(uart: &mut Uart<'static, Async>, aux_pin: &mut 
             return;
         }
     }
-    if let Err(error) = uart.flush_async().await {
+    if let Err(error) = tx.flush_async().await {
         LORA_TX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
         println!("LoRa UART flush error: {:?}", error);
         return;
@@ -187,41 +187,40 @@ pub async fn command_process_task() {
 }
 
 #[embassy_executor::task]
-pub async fn lora_task(mut uart: Uart<'static, Async>, mut aux_pin: Input<'static>) {
-    let mut rx_buf = [0u8; 3];
+pub async fn lora_rx_task(mut rx: UartRx<'static, Async>) {
+    let mut rx_buf = [0u8; 32];
     let mut uplink_frame = UplinkFrameBuffer::new();
-    let mut tx_ticker = Ticker::every(Duration::from_millis(LORA_TRANSMIT_INTERVAL_MS));
 
     loop {
-        match select3(
-            TRIGGER_SIGNAL.wait(),
-            uart.read_async(&mut rx_buf),
-            tx_ticker.next(),
-        )
-        .await
-        {
-            Either3::First(_trigger) => {
-                transmit_latest_payload(&mut uart, &mut aux_pin).await;
-            }
-            Either3::Second(Ok(len)) => {
-                if len > 0 {
-                    println!("cmd: {:?}", &rx_buf[..len]);
-                    for &byte in &rx_buf[..len] {
-                        if let Some(command) = uplink_frame.push(byte)
-                            && GroundCommand::decode_legacy(command).is_some()
-                        {
-                            RECEIVED_DATA_CHANNEL.send(command).await;
-                        }
+        match rx.read_async(&mut rx_buf).await {
+            Ok(len) => {
+                for &byte in &rx_buf[..len] {
+                    if let Some(command) = uplink_frame.push(byte)
+                        && GroundCommand::decode_legacy(command).is_some()
+                        && RECEIVED_DATA_CHANNEL.try_send(command).is_err()
+                    {
+                        LORA_COMMAND_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
-            Either3::Second(Err(error)) => {
+            Err(error) => {
                 LORA_RX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
-                println!("LoRa UART receive error: {:?}", error);
-            }
-            Either3::Third(_) => {
-                transmit_latest_payload(&mut uart, &mut aux_pin).await;
+                uplink_frame.reset();
+                match error {
+                    RxError::FifoOverflowed => println!("LoRa UART RX FIFO overflowed"),
+                    _ => println!("LoRa UART receive error: {:?}", error),
+                }
             }
         }
+    }
+}
+
+#[embassy_executor::task]
+pub async fn lora_tx_task(mut tx: UartTx<'static, Async>, mut aux_pin: Input<'static>) {
+    let mut tx_ticker = Ticker::every(Duration::from_millis(LORA_TRANSMIT_INTERVAL_MS));
+
+    loop {
+        let _ = select(TRIGGER_SIGNAL.wait(), tx_ticker.next()).await;
+        transmit_latest_payload(&mut tx, &mut aux_pin).await;
     }
 }

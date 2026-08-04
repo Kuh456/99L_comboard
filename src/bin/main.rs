@@ -13,7 +13,7 @@ use c99l_comboard::{
     state::IS_CAN_ERROR,
     tasks::{
         SdTimeSource, SdVolumeManager, can_communication_task, command_process_task,
-        gnss_manager_task, lora_task, parse_gnss_task, sd_write_task,
+        gnss_manager_task, lora_rx_task, lora_tx_task, parse_gnss_task, sd_write_task,
     },
 };
 use embassy_executor::Spawner;
@@ -168,11 +168,13 @@ async fn main(spawner0: Spawner) -> ! {
                     .with_rx(lora_rx)
                     .with_tx(lora_tx)
                     .into_async();
+                let (lora_uart_rx, lora_uart_tx) = uart2.split();
 
                 spawner.spawn(can_communication_task(can).unwrap());
                 spawner.spawn(command_process_task().unwrap());
                 spawner.spawn(parse_gnss_task().unwrap());
-                spawner.spawn(lora_task(uart2, aux_pin).unwrap());
+                spawner.spawn(lora_rx_task(lora_uart_rx).unwrap());
+                spawner.spawn(lora_tx_task(lora_uart_tx, aux_pin).unwrap());
             });
         },
     );
