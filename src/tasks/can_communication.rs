@@ -15,9 +15,7 @@ use crate::{
             CommandFailure, CommandFailureRecord, CommandRequestState, queued_request_is_current,
         },
         health::{CanHealth, classify_can_health},
-        protocol::{
-            CanRxMessage, ControllerLinkState, ControllerStatus, controller_status_effects,
-        },
+        protocol::{CanRxMessage, ControllerLinkState, ControllerStatus},
         tx::{CanTxError, transmit_message_with_timeout},
     },
     constants::{
@@ -30,7 +28,7 @@ use crate::{
         CONTROLLER_STATUS_RAW, CONTROLLER_STATUS_RX_COUNT, CONTROLLER_STATUS_STATE,
         FIN_ANGLE_DROPPED_COUNT, HAS_VALID_CONTROLLER_STATUS, IS_CAN_ERROR, LAST_COMMAND_FAILURE,
         LATEST_LOGGING_GENERATION, LATEST_PARA_POSITION_GENERATION, LATEST_SEQUENCE_GENERATION,
-        LEGACY_LIFTOFF_TOP_RX_COUNT, PAYLOAD_MUTEX, TRIGGER_SIGNAL,
+        LEGACY_LIFTOFF_TOP_RX_COUNT, PAYLOAD_MUTEX,
     },
 };
 
@@ -158,16 +156,6 @@ async fn apply_received_message(message: CanRxMessage) {
     }
 }
 
-fn previous_controller_status() -> Option<ControllerStatus> {
-    if !HAS_VALID_CONTROLLER_STATUS.load(Ordering::Relaxed) {
-        return None;
-    }
-
-    Some(ControllerStatus::from_raw(
-        CONTROLLER_STATUS_RAW.load(Ordering::Relaxed),
-    ))
-}
-
 async fn apply_controller_status(status: ControllerStatus) {
     {
         let mut controller = CONTROLLER_STATUS_STATE.lock().await;
@@ -177,7 +165,6 @@ async fn apply_controller_status(status: ControllerStatus) {
     }
     CONTROLLER_STATUS_RX_COUNT.fetch_add(1, Ordering::Relaxed);
 
-    let effects = controller_status_effects(previous_controller_status(), status);
     CONTROLLER_STATUS_RAW.store(status.raw(), Ordering::Relaxed);
     HAS_VALID_CONTROLLER_STATUS.store(true, Ordering::Relaxed);
     PAYLOAD_MUTEX.lock().await.status = status.raw();
@@ -191,10 +178,6 @@ async fn apply_controller_status(status: ControllerStatus) {
         println!("CAN command confirmed by controller: {:?}", command);
     }
     drop(request_state);
-
-    if effects.top_rising {
-        TRIGGER_SIGNAL.signal(true);
-    }
 }
 
 async fn mark_request_transmitted(token: u32) {

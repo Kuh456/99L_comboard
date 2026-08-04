@@ -22,7 +22,7 @@ use esp_println::println;
 use heapless::String;
 use settings::{
     DYNAMIC_MODEL_AIRBORNE_4G, GLL_DELETE, GSA_DELETE, GST_ENABLE_UART1, GSV_DELETE, MEAS_RATE,
-    SLAS_EN, UART_BAUD, VTG_DELETE,
+    QZSS_L1S_ENABLE, UART_BAUD, VTG_DELETE,
 };
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -64,8 +64,8 @@ const COMMANDS: &[NamedCommand] = &[
         bytes: MEAS_RATE,
     },
     NamedCommand {
-        name: "SLAS_EN",
-        bytes: SLAS_EN,
+        name: "QZSS_L1S_ENABLE",
+        bytes: QZSS_L1S_ENABLE,
     },
     NamedCommand {
         name: "DYNAMIC_MODEL_AIRBORNE_4G",

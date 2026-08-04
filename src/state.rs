@@ -84,7 +84,6 @@ pub static COMMAND_REQUEST_STATE: Mutex<CriticalSectionRawMutex, CommandRequestS
 pub static LAST_COMMAND_FAILURE: Mutex<CriticalSectionRawMutex, Option<CommandFailureRecord>> =
     Mutex::new(None);
 pub static COMMAND_REQUEST_FAILURE_COUNT: AtomicU32 = AtomicU32::new(0);
-pub static TRIGGER_SIGNAL: Signal<CriticalSectionRawMutex, bool> = Signal::new();
 pub static GNSS_CHANNEL: Channel<CriticalSectionRawMutex, GnssPacket, 5> = Channel::new();
 pub static RECEIVED_DATA_CHANNEL: Channel<CriticalSectionRawMutex, u8, 10> = Channel::new();
 pub static PAYLOAD_MUTEX: Mutex<CriticalSectionRawMutex, Payload> = Mutex::new(Payload::new());

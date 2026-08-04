@@ -1,5 +1,6 @@
 pub const BUF_SIZE: usize = 2048;
-pub const LORA_TRANSMIT_INTERVAL_MS: u64 = 250;
+pub const LORA_TRANSMIT_INTERVAL_MS: u64 = 150;
+pub const LORA_RX_TX_GUARD_MS: u64 = 60;
 pub const SD_LOG_INTERVAL_MS: u64 = 100;
 pub const SD_FLUSH_INTERVAL_SECS: u64 = 1;
 pub const CAN_TX_TIMEOUT_MS: u64 = 100;
